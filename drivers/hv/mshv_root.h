@@ -384,6 +384,14 @@ int hv_call_write_gpa(u32 vp_index, u64 partition_id,
 		      u64 gpa_base, u8 *data, u32 byte_count,
 		      union hv_access_gpa_result *result);
 
+#ifdef HV_SUPPORTS_SEV_SNP_GUESTS
+int hv_call_issue_psp_guest_request(u64 partition_id, u64 req_pfn,
+				    u64 rsp_pfn,
+				    void (*completion_handler)(void *data,
+							       u64 *status),
+				    void *completion_data);
+#endif
+
 #if IS_ENABLED(CONFIG_DEBUG_FS)
 int __init mshv_debugfs_init(void);
 void mshv_debugfs_exit(void);
