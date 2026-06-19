@@ -743,6 +743,8 @@ static struct notifier_block mshv_synic_reboot_nb = {
 };
 
 #ifndef HYPERVISOR_CALLBACK_VECTOR
+#define MSHV_ROOT_FIXED_SINT_VECTOR 31
+
 static DEFINE_PER_CPU(long, mshv_evt);
 
 static irqreturn_t mshv_percpu_isr(int irq, void *dev_id)
@@ -784,12 +786,26 @@ static int __init mshv_sint_vector_setup(void)
 	if (acpi_disabled)
 		return -ENODEV;
 
+	if (hv_root_partition()) {
+		/*
+		 * Use a fixed vector because the hypervisor doesn't yet support
+		 * the HV_ARM64_REGISTER_SINT_RESERVED_INTERRUPT_ID register for
+		 * root partitions. This is a temporary workaround until the
+		 * hypervisor supports this register for root partitions.
+		 */
+		mshv_sint_vector = MSHV_ROOT_FIXED_SINT_VECTOR;
+		goto setup_irq;
+	}
+
 	ret = hv_call_get_vp_registers(HV_VP_INDEX_SELF, HV_PARTITION_ID_SELF,
 				1, input_vtl, &reg);
+
 	if (ret || !reg.value.reg64)
 		return -ENODEV;
 
 	mshv_sint_vector = reg.value.reg64;
+
+setup_irq:
 	ret = mshv_acpi_setup_sint_irq();
 	if (ret < 0) {
 		pr_err("Failed to setup IRQ for MSHV SINT vector %d: %d\n",
