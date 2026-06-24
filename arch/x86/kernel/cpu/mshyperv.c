@@ -474,6 +474,14 @@ static void __init hv_smp_prepare_cpus(unsigned int max_cpus)
 		i = next_smallest_apicid(apicids, i);
 	}
 
+	/*
+	 * Notify MSHV after all logical processors have been added to the
+	 * root partition. Hyper-V exposes SEV-SNP guest launch support only
+	 * after this event.
+	 */
+	ret = hv_call_notify_all_processors_started();
+	WARN_ON(ret);
+
 	lpidx = 1;	   /* skip BSP cpu 0 */
 	for_each_present_cpu(i) {
 		if (i == 0)
