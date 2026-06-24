@@ -433,7 +433,7 @@ struct mshv_read_write_gpa {
 	_IOW(MSHV_IOCTL, 0xF3, struct mshv_register_intercept_result)
 #define MSHV_GET_VP_CPUID_VALUES	_IOWR(MSHV_IOCTL, 0xF4, struct mshv_get_vp_cpuid_values)
 #define MSHV_READ_GPA			_IOWR(MSHV_IOCTL, 0xF5, struct mshv_read_write_gpa)
-#define MSHV_WRITE_GPA			_IOWR(MSHV_IOCTL, 0xF6, struct mshv_read_write_gpa)
+#define MSHV_WRITE_GPA			_IOW(MSHV_IOCTL, 0xF6, struct mshv_read_write_gpa)
 
 /*
  * Generic hypercall
