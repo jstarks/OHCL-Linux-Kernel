@@ -246,6 +246,7 @@ static inline u64 hv_build_devid_type_pci(struct pci_dev *pdev) { return 0; }
 #endif /* IS_ENABLED(CONFIG_HYPERV_IOMMU) */
 
 #if IS_ENABLED(CONFIG_MSHV_ROOT) && IS_ENABLED(CONFIG_CRASH_DUMP)
+extern bool hv_crash_enabled;
 void hv_root_crash_init(void);
 void hv_crash_asm32(void);
 void hv_crash_asm64(void);
