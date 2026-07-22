@@ -724,12 +724,13 @@ static int mshv_gpfns_to_pages(struct mshv_partition *partition,
  * Check if uaddr is for mmio range. If yes, return 0 with mmio_pfn filled in
  * else just return -errno.
  */
-static int mshv_chk_get_mmio_start_pfn(u64 uaddr, u64 *mmio_pfnp)
+static int mshv_chk_get_mmio_start_pfn(u64 uaddr, u64 *mmio_pfnp, bool wr)
 {
 	struct vm_area_struct *vma;
 	bool is_mmio;
 	struct follow_pfnmap_args pfnmap_args;
 	int rc = -EINVAL;
+	enum fault_flag prot = wr ? FAULT_FLAG_WRITE : 0;
 
 	mmap_read_lock(current->mm);
 	vma = vma_lookup(current->mm, uaddr);
@@ -742,8 +743,7 @@ static int mshv_chk_get_mmio_start_pfn(u64 uaddr, u64 *mmio_pfnp)
 
 	rc = follow_pfnmap_start(&pfnmap_args);
 	if (rc) {
-		rc = fixup_user_fault(current->mm, uaddr, FAULT_FLAG_WRITE,
-				      NULL);
+		rc = fixup_user_fault(current->mm, uaddr, prot, NULL);
 		if (rc)
 			goto unlock_mmap_out;
 
@@ -771,6 +771,7 @@ static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp)
 	u64 gfn, uaddr, mmio_mfn;
 	struct mshv_mem_region *rg;
 	int rc = -EINVAL;
+	bool writable;
 	struct mshv_partition *pt = vp->vp_partition;
 #if defined(CONFIG_X86_64)
 	struct hv_x64_memory_intercept_message *msg =
@@ -790,11 +791,15 @@ static bool mshv_handle_unmapped_gpa(struct mshv_vp *vp)
 
 	uaddr = rg->start_uaddr + ((gfn - rg->start_gfn) << HV_HYP_PAGE_SHIFT);
 
-	rc = mshv_chk_get_mmio_start_pfn(uaddr, &mmio_mfn);
+	writable = rg->hv_map_flags & HV_MAP_GPA_WRITABLE;
+	rc = mshv_chk_get_mmio_start_pfn(uaddr, &mmio_mfn, writable);
 	if (rc)
 		goto put_rg_out;
 
-	rc = hv_map_mmio_pages(pt->pt_id, rg, gfn, mmio_mfn);
+	mmio_mfn = mmio_mfn - (gfn - rg->start_gfn);   /* start of the range */
+
+	/* Map the entire mmio region now */
+	rc = hv_map_mmio_pages(pt->pt_id, rg, mmio_mfn);
 
 put_rg_out:
 	mshv_region_put(rg);
@@ -1815,6 +1820,14 @@ mshv_map_user_memory(struct mshv_partition *partition,
 
 	if (!vma)
 		return -EINVAL;
+
+	if (is_mmio) {
+		size_t vma_sz = vma->vm_end - vma->vm_start;
+
+		/* Upon mmio intercept, entire region is mapped */
+		if (mem->size > vma_sz)
+			return -EPERM;
+	}
 
 	ret = mshv_partition_create_region(partition, mem, &region,
 					   is_mmio);

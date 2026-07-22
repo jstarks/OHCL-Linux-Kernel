@@ -106,6 +106,8 @@ static void hv_iommu_detach_dev(struct hv_domain *hvdom, struct device *dev);
 static size_t hv_iommu_unmap_pages(struct iommu_domain *immdom, ulong iova,
 				   size_t pgsize, size_t pgcount,
 				   struct iommu_iotlb_gather *gather);
+static size_t hv_iommu_del_tree_mappings(struct hv_domain *hvdom,
+					unsigned long iova, size_t size);
 
 /*
  * If the current thread is a VMM thread, return the partition id of the VM it
@@ -314,6 +316,9 @@ static void hv_iommu_domain_free(struct iommu_domain *immdom)
 
 	if (hv_special_domain(hvdom))
 		return;
+
+        /* 0 for size results in ULONG_MAX as the last byte */
+        hv_iommu_del_tree_mappings(hvdom, 0, 0);
 
 	if (!hv_dom_owner_is_vmm(hvdom) || hv_no_attdev) {
 		struct hv_input_device_domain *ddp;
@@ -708,15 +713,39 @@ static int hv_iommu_map_pages(struct iommu_domain *immdom, ulong iova,
 	return hv_result_to_errno(status);
 }
 
+static u64 hv_iommu_unmap_batch(u32 domid_num, ulong iova, u16 count)
+{
+	ulong flags;
+	struct hv_input_unmap_device_gpa_pages *input;
+	u64 status;
+
+	local_irq_save(flags);
+	input = *this_cpu_ptr(hyperv_pcpu_input_arg);
+	memset(input, 0, sizeof(*input));
+
+	input->device_domain.partition_id = HV_PARTITION_ID_SELF;
+	input->device_domain.domain_id.type = HV_DEVICE_DOMAIN_TYPE_S2;
+	input->device_domain.domain_id.id = domid_num;
+	input->target_device_va_base = iova;
+
+	status = hv_do_rep_hypercall(HVCALL_UNMAP_DEVICE_GPA_PAGES, count,
+				     0, input, NULL);
+	local_irq_restore(flags);
+
+	if (!hv_result_success(status))
+		hv_status_err(status, "iova:0x%lx count:0x%x\n", iova, count);
+
+	return status;
+}
+
 static size_t hv_iommu_unmap_pages(struct iommu_domain *immdom, ulong iova,
 				   size_t pgsize, size_t pgcount,
 				   struct iommu_iotlb_gather *gather)
 {
-	unsigned long flags, npages;
-	struct hv_input_unmap_device_gpa_pages *input;
+	unsigned long npages;
 	u64 status;
 	struct hv_domain *hvdom = to_hv_domain(immdom);
-	size_t unmapped, size = pgsize * pgcount;
+	size_t unmapped, tot_done = 0, size = pgsize * pgcount;
 
 	unmapped = hv_iommu_del_tree_mappings(hvdom, iova, size);
 	if (unmapped < size)
@@ -726,25 +755,23 @@ static size_t hv_iommu_unmap_pages(struct iommu_domain *immdom, ulong iova,
 	if (hvdom->attached_dom)
 		return size;
 
-	npages = size >> HV_HYP_PAGE_SHIFT;
+	npages = unmapped >> HV_HYP_PAGE_SHIFT;
 
-	local_irq_save(flags);
-	input = *this_cpu_ptr(hyperv_pcpu_input_arg);
-	memset(input, 0, sizeof(*input));
+	while (npages) {
+		int done, count = min(npages, HV_REP_COUNT_MAX);
 
-	input->device_domain.partition_id = HV_PARTITION_ID_SELF;
-	input->device_domain.domain_id.type = HV_DEVICE_DOMAIN_TYPE_S2;
-	input->device_domain.domain_id.id = hvdom->domid_num;
-	input->target_device_va_base = iova;
+		status = hv_iommu_unmap_batch(hvdom->domid_num, iova, count);
 
-	status = hv_do_rep_hypercall(HVCALL_UNMAP_DEVICE_GPA_PAGES, npages,
-				     0, input, NULL);
-	local_irq_restore(flags);
+		done = hv_repcomp(status);
+		tot_done += done;
+		npages -= done;
+		iova += done << HV_HYP_PAGE_SHIFT;
 
-	if (!hv_result_success(status))
-		hv_status_err(status, "\n");
+		if (!hv_result_success(status))
+			break;
+	}
 
-	return unmapped;
+	return tot_done << HV_HYP_PAGE_SHIFT;
 }
 
 static phys_addr_t hv_iommu_iova_to_phys(struct iommu_domain *immdom,

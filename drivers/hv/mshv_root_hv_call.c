@@ -15,10 +15,6 @@
 
 #include "mshv_root.h"
 
-static bool hv_nofull_mmio;	/* don't map entire mmio region upon fault */
-module_param(hv_nofull_mmio, bool, 0644);
-MODULE_PARM_DESC(hv_nofull_mmio, "If set only map 1 page upon guest mmio fault");
-
 /* Determined empirically */
 #define HV_UMAP_GPA_PAGES		512
 
@@ -346,38 +342,37 @@ int hv_call_map_gpa_pages(u64 partition_id, u64 gpa_target, u64 page_count,
  * slightly better performance, and in that case the guest state 1 page table
  * will control caching.
  */
-int hv_map_mmio_pages(u64 partition_id, struct mshv_mem_region *reg, u64 gfn,
+int hv_map_mmio_pages(u64 partition_id, struct mshv_mem_region *reg,
 		      u64 mmio_mfn)
 {
 	int rc;
-	u32 numpgs, flags = HV_MAP_GPA_READABLE;
-	u64 hpages, numpgs_in_hpage = HPAGE_SIZE / PAGE_SIZE;
+	u64 gfn, start_mmio_mfn, hpages;
+	u32 numpgs = 0, flags = HV_MAP_GPA_READABLE;
+	u64 numpgs_in_hpage = HPAGE_SIZE / PAGE_SIZE;
 
 	if (reg->hv_map_flags & HV_MAP_GPA_WRITABLE)
 		flags |= HV_MAP_GPA_WRITABLE;
 	if (reg->hv_map_flags & HV_MAP_GPA_EXECUTABLE)
 		flags |= HV_MAP_GPA_EXECUTABLE;
 
-	if (hv_nofull_mmio)
-		return hv_do_map_gpa_hcall(partition_id, gfn, 1, flags, NULL,
-					   mmio_mfn);
-
-	/* default case: map the whole region */
-
-	mmio_mfn = mmio_mfn - (gfn - reg->start_gfn);	/* start of the range */
-
-	numpgs = 0;
+	/*
+	 * Any significantly large range is expected to be properly aligned,
+	 * so keep it simple.
+	 */
 	gfn = reg->start_gfn;
-	while (!HV_PAGE_COUNT_2M_ALIGNED(gfn) && numpgs < reg->nr_pages) {
+	start_mmio_mfn = mmio_mfn;
+	while (!HV_PAGE_COUNT_2M_ALIGNED(gfn) &&
+	       !HV_PAGE_COUNT_2M_ALIGNED(mmio_mfn) &&
+	       numpgs < reg->nr_pages) {
 		numpgs++;
 		gfn++;
+		mmio_mfn++;
 	}
 	rc = hv_do_map_gpa_hcall(partition_id, reg->start_gfn, numpgs, flags,
-				 NULL, mmio_mfn);
+				 NULL, start_mmio_mfn);
 	if (rc || numpgs == reg->nr_pages)
 		return rc;
 
-	mmio_mfn = mmio_mfn + numpgs;
 	numpgs = reg->nr_pages - numpgs;
 
 	if (numpgs < numpgs_in_hpage)
