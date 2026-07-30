@@ -13,6 +13,35 @@
 #define HV_DEPOSIT_INP_MAX ((HV_HYP_PAGE_SIZE -  \
 	offsetof(struct hv_deposit_memory, gpa_page_list)) / sizeof(u64))
 
+static int hv_alloc_contig_pages(int node, u64 *pfna, u64 *lastpfnp,
+				 int num_pages)
+{
+	void *p;
+	int i, tmp;
+	ulong pfn;
+	size_t size = num_pages * HV_HYP_PAGE_SIZE;
+
+	if (num_pages > HV_DEPOSIT_MAX ||
+	    (num_pages == HV_DEPOSIT_MAX && lastpfnp == NULL))
+		return -EINVAL;
+
+	p = kmalloc_node(size, GFP_KERNEL, node);
+	if (p == NULL)
+		return -ENOMEM;
+
+	pfn = PFN_DOWN(virt_to_phys(p));
+	tmp = min(num_pages, HV_DEPOSIT_INP_MAX);
+
+	for (i = 0; i < tmp; i++, pfn++)
+		pfna[i] = pfn;
+
+	if (num_pages == HV_DEPOSIT_MAX)
+		*lastpfnp = pfn;
+
+	return num_pages;
+}
+
+
 /*
  * Allocate free pages for deposit to hypervisor. pfna[] must be large enough
  * to hold HV_DEPOSIT_INP_MAX (511) pages. If num_pages is 512, return last
@@ -20,11 +49,10 @@
  *
  * Returns : -ENOMEM if zero allocated, else number of pages allocated
  */
-static int hv_alloc_dep_pages(int node, u64 *pfna, u64 *lastpfnp, int num_pages,
-			      bool contiguous)
+static int hv_alloc_dep_pages(int node, u64 *pfna, u64 *lastpfnp, int num_pages)
 {
 	struct page *page;
-	int num_allocd, count = 0, rc = 0;
+	int num_allocd, count = 0;
 
 	/* Published ABI, enforce its immutability. */
 	BUILD_BUG_ON(HV_DEPOSIT_INP_MAX != 511);
@@ -33,14 +61,13 @@ static int hv_alloc_dep_pages(int node, u64 *pfna, u64 *lastpfnp, int num_pages,
 	    (num_pages == HV_DEPOSIT_MAX && lastpfnp == NULL))
 		return -EINVAL;
 
-	*lastpfnp = 0;
 	while (num_pages) {
 		/* Find highest order we can actually allocate */
 		int order = 31 - __builtin_clz(num_pages);
 
 		while (1) {
 			page = alloc_pages_node(node, GFP_KERNEL, order);
-			if (page || order == 0 || contiguous)
+			if (page || order == 0)
 				break;
 
 			order--;
@@ -65,19 +92,13 @@ static int hv_alloc_dep_pages(int node, u64 *pfna, u64 *lastpfnp, int num_pages,
 		}
 	}
 
-	if (count == 0)
-		rc = -ENOMEM;
-	else
-		rc = count;
-
-	return rc;
+	return count ? count : -ENOMEM;
 }
 
 /*
  * Deposit memory in the hypervisor. A contiguous 2M worth of pfns is utmost
  * desired, but short of that, we deposit whatever contiguous chunks we can
- * get. If contiguous parameter is true, then the hypervisor requires deposited
- * memory to be contiguous.
+ * get. 
  */
 static int hv_call_deposit_pages(int node, u64 partition_id, bool contiguous)
 {
@@ -99,7 +120,10 @@ static int hv_call_deposit_pages(int node, u64 partition_id, bool contiguous)
 	hc_input->partition_id = partition_id;
 	pfna = hc_input->gpa_page_list;
 
-	rc = hv_alloc_dep_pages(node, pfna, &lastpfn, num_pages, contiguous);
+	if (contiguous)
+		rc = hv_alloc_contig_pages(node, pfna, &lastpfn, num_pages);
+	else
+		rc = hv_alloc_dep_pages(node, pfna, &lastpfn, num_pages);
 	if (rc < 0)
 		goto out_free;
 
@@ -118,10 +142,9 @@ static int hv_call_deposit_pages(int node, u64 partition_id, bool contiguous)
 	}
 
 	if (lastpfn) {
-		num_pages = 1;
 		hc_input->gpa_page_list[0] = lastpfn;
-		status = hv_do_rep_hypercall(HVCALL_DEPOSIT_MEMORY, num_pages,
-					     0, hc_input, NULL);
+		status = hv_do_rep_hypercall(HVCALL_DEPOSIT_MEMORY, 1, 0,
+					     hc_input, NULL);
 		if (!hv_result_success(status))
 			/* We deposited some earlier, so just free this */
 			__free_page(pfn_to_page(lastpfn));
