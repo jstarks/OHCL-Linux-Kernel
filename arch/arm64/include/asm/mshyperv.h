@@ -59,6 +59,37 @@ static inline u64 hv_get_non_nested_msr(unsigned int reg)
 void hv_smp_prepare_cpus(unsigned int max_cpus);
 int hv_cpu_on(unsigned int cpu, phys_addr_t entry_point);
 
+/* Root partition PCI MSI irqdomain (see drivers/irqchip/irq-mshv-gicv3-msi.c) */
+struct irq_data;
+struct irq_domain;
+struct msi_msg;
+struct pci_dev;
+struct hv_interrupt_entry;
+
+int hv_map_msi_interrupt(struct irq_data *data,
+			 struct hv_interrupt_entry *out_entry);
+void hv_irq_compose_msi_msg(struct irq_data *data, struct msi_msg *msg);
+int hv_unmap_msi_interrupt(struct pci_dev *pdev,
+			   struct hv_interrupt_entry *hvirqe);
+
+#ifdef CONFIG_MSHV_GICV3_MSI
+extern struct irq_domain *hv_pci_msi_domain;
+
+void __init hv_pci_msi_early_init(void);
+
+static inline struct irq_domain *hv_pci_get_msi_domain(void)
+{
+	return hv_pci_msi_domain;
+}
+#else
+static inline void hv_pci_msi_early_init(void) { }
+
+static inline struct irq_domain *hv_pci_get_msi_domain(void)
+{
+	return NULL;
+}
+#endif
+
 /* SMCCC hypercall parameters */
 #define HV_SMCCC_FUNC_NUMBER	1
 #define HV_FUNC_ID	ARM_SMCCC_CALL_VAL(			\

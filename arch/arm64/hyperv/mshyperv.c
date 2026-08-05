@@ -107,6 +107,12 @@ void __init hyperv_early_init(void)
 
 	hv_identify_partition_type();
 
+	/*
+	 * Must run before irqchip_init() so that the GICv3 driver knows to
+	 * set up the LPI tables even though the hypervisor exposes no ITS.
+	 */
+	hv_pci_msi_early_init();
+
 	hyperv_present = true;
 }
 
