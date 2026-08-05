@@ -642,6 +642,12 @@ int its_init(struct fwnode_handle *handle, struct rdists *rdists,
 	     struct irq_domain *domain, u8 irq_prio);
 int mbi_init(struct fwnode_handle *fwnode, struct irq_domain *parent);
 
+#ifdef CONFIG_ARM_GIC_V3_ITS
+void __init gic_request_lpis_without_its(void);
+#else
+static inline void gic_request_lpis_without_its(void) { }
+#endif
+
 static inline bool gic_enable_sre(void)
 {
 	u32 val;
