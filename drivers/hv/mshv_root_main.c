@@ -3529,9 +3529,14 @@ static int __init mshv_check_sev_snp_support(struct device *dev)
 	status = hv_do_hypercall(HVCALL_GET_SYSTEM_PROPERTY, input, output);
 	if (!hv_result_success(status)) {
 		local_irq_restore(flags);
-		dev_err(dev, "Failed to get SNP support: %s\n",
-			hv_result_to_string(status));
-		return hv_result_to_errno(status);
+
+		/*
+		 * Failing doesn't necessarily mean a fatal error. On L1VH,
+		 * MSHV rejects this call. Move on as if SEV-SNP is not
+		 * available.
+		 */
+		dev_info(dev, "SEV-SNP support is not available");
+		return 0;
 	}
 
 	snp_status = output->hv_processor_feature_value;
