@@ -371,7 +371,7 @@ static inline u64 hv_pci_vmbus_device_id(struct pci_dev *pdev)
 { return 0; }
 #endif /* IS_ENABLED(CONFIG_PCI_HYPERV) */
 
-#if IS_ENABLED(CONFIG_HYPERV_IOMMU)
+#if IS_ENABLED(CONFIG_HYPERV_IOMMU) || IS_ENABLED(CONFIG_HYPERV_IOMMU_ARM)
 u64 hv_get_current_partid(void);
 bool hv_pcidev_is_attached_dev(struct pci_dev *pdev);
 bool hv_pcidev_is_pthru_dev(struct pci_dev *pdev);
@@ -389,7 +389,7 @@ static inline u64 hv_devid_from_pdev(struct pci_dev *pdev)
 { return 0; }
 static inline u64 hv_get_current_partid(void)
 { return HV_PARTITION_ID_INVALID; }
-#endif /* IS_ENABLED(CONFIG_HYPERV_IOMMU) */
+#endif /* IS_ENABLED(CONFIG_HYPERV_IOMMU) || IS_ENABLED(CONFIG_HYPERV_IOMMU_ARM) */
 #else /* CONFIG_HYPERV */
 static inline void hv_identify_partition_type(void) {}
 static inline bool hv_is_hyperv_initialized(void) { return false; }
