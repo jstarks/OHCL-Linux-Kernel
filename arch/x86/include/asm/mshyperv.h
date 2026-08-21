@@ -51,6 +51,7 @@ extern union hv_ghcb * __percpu *hv_ghcb_pg;
 
 bool hv_isolation_type_snp(void);
 bool hv_isolation_type_tdx(void);
+bool hv_isolation_hw_cvm(void);
 
 #ifdef CONFIG_X86_64
 DECLARE_STATIC_CALL(hv_hypercall, hv_std_hypercall);

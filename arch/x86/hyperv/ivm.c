@@ -943,3 +943,8 @@ bool hv_isolation_type_tdx(void)
 {
 	return static_branch_unlikely(&isolation_type_tdx);
 }
+
+bool hv_isolation_hw_cvm(void)
+{
+	return hv_isolation_type_snp() || hv_isolation_type_tdx();
+}

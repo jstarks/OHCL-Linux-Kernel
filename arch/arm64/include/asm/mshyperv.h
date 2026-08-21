@@ -71,6 +71,7 @@ int hv_map_msi_interrupt(struct irq_data *data,
 void hv_irq_compose_msi_msg(struct irq_data *data, struct msi_msg *msg);
 int hv_unmap_msi_interrupt(struct pci_dev *pdev,
 			   struct hv_interrupt_entry *hvirqe);
+bool hv_isolation_hw_cvm(void);
 
 #ifdef CONFIG_MSHV_GICV3_MSI
 extern struct irq_domain *hv_pci_msi_domain;
