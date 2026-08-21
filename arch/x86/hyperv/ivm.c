@@ -364,7 +364,7 @@ int hv_snp_boot_ap(u32 apic_id, unsigned long start_ip, unsigned int cpu)
 	do {
 		ret = hv_do_hypercall(HVCALL_START_VP,
 				      start_vp_input, NULL);
-	} while (hv_result(ret) == HV_STATUS_TIME_OUT && retry--);
+	} while (hv_result(ret) == HV_STATUS_TIMEOUT && retry--);
 
 	local_irq_restore(flags);
 

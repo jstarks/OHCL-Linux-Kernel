@@ -56,16 +56,20 @@ int hv_call_get_vp_registers(u32 vp_index, u64 partition_id, u16 count,
 
 		status = hv_do_rep_hypercall(HVCALL_GET_VP_REGISTERS, rep_count,
 					     0, input_page, output_page);
-		if (!hv_result_success(status))
-			break;
-
 		completed = hv_repcomp(status);
 		for (i = 0; i < completed; ++i)
 			registers[i].value = output_page[i];
 
 		registers += completed;
 		remaining -= completed;
+
+		if (!hv_result_success(status)) {
+			pr_err("%s: count:%d comp:%d st:0x%llx\n", __func__,
+			       count, completed, status);
+			break;
+		}
 	}
+
 	local_irq_restore(flags);
 
 	return hv_result_to_errno(status);
@@ -99,12 +103,15 @@ int hv_call_set_vp_registers(u32 vp_index, u64 partition_id, u16 count,
 
 		status = hv_do_rep_hypercall(HVCALL_SET_VP_REGISTERS, rep_count,
 					     0, input_page, NULL);
-		if (!hv_result_success(status))
-			break;
-
 		completed = hv_repcomp(status);
 		registers += completed;
 		remaining -= completed;
+
+		if (!hv_result_success(status)) {
+			pr_err("%s: count:%d comp:%d st:0x%llx\n", __func__,
+			       count, completed, status);
+			break;
+		}
 	}
 
 	local_irq_restore(flags);

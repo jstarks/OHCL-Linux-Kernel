@@ -301,6 +301,7 @@ static int hv_do_map_gpa_hcall(u64 partition_id, u64 gfn, u64 page_struct_count,
 		local_irq_restore(irq_flags);
 
 		completed = hv_repcomp(status);
+		done += completed;
 
 		if (hv_result_needs_memory(status)) {
 			ret = hv_deposit_memory(partition_id, status);
@@ -308,14 +309,12 @@ static int hv_do_map_gpa_hcall(u64 partition_id, u64 gfn, u64 page_struct_count,
 				break;
 
 		} else if (!hv_result_success(status)) {
-			pr_err("%s: failed to map pages at gfn %#llx: completed %u/%llu, flags=%#x, status=%#llx (%s)\n",
+			pr_err("%s: failed to map pages at gfn %#llx: done %u/%llu, flags=%#x, status=%#llx (%s)\n",
 			       __func__, gfn, done, page_count, flags, status,
 			       hv_result_to_string(hv_result(status)));
 			ret = hv_result_to_errno(status);
 			break;
 		}
-
-		done += completed;
 	}
 
 	if (ret && done) {
@@ -468,20 +467,22 @@ int hv_call_get_gpa_access_states(u64 partition_id, u32 count, u64 gpa_base_pfn,
 		input_page->flags = state_flags;
 		rep_count = min(remaining, HV_GET_GPA_ACCESS_STATES_BATCH_SIZE);
 
-		status = hv_do_rep_hypercall(HVCALL_GET_GPA_PAGES_ACCESS_STATES, rep_count,
-					     0, input_page, output_page);
-		if (!hv_result_success(status)) {
-			local_irq_restore(flags);
-			break;
-		}
+		status = hv_do_rep_hypercall(HVCALL_GET_GPA_PAGES_ACCESS_STATES,
+					     rep_count, 0, input_page,
+					     output_page);
+
 		completed = hv_repcomp(status);
 		for (i = 0; i < completed; ++i)
 			states[i].as_uint8 = output_page[i].as_uint8;
 
 		local_irq_restore(flags);
+
 		states += completed;
 		*written_total += completed;
 		remaining -= completed;
+
+		if (!hv_result_success(status))
+			break;
 	}
 
 	return hv_result_to_errno(status);

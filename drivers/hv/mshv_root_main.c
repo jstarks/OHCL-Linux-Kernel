@@ -240,9 +240,9 @@ static int mshv_ioctl_passthru_hvcall(struct mshv_partition *partition,
 	reps_completed = 0;
 	do {
 		if (args.reps) {
-			status = hv_do_rep_hypercall_ex(args.code, args.reps,
-							0, reps_completed,
-							input_pg, output_pg);
+			status = hv_do_rep_hypercall_reg(args.code, args.reps,
+							 0, reps_completed,
+							 input_pg, output_pg);
 			reps_completed = hv_repcomp(status);
 		} else {
 			status = hv_do_hypercall(args.code, input_pg, output_pg);

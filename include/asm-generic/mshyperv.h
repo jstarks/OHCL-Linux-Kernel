@@ -29,7 +29,7 @@
 
 #define VTPM_BASE_ADDRESS 0xfed40000
 
-#define HV_REP_COUNT_MAX        \
+#define HV_REP_COUNT_MAX	\
 	(HV_HYPERCALL_REP_COMP_MASK >> HV_HYPERCALL_REP_COMP_OFFSET)
 
 enum hv_partition_type {
@@ -78,6 +78,7 @@ extern void * __percpu *hyperv_pcpu_output_arg;
 u64 hv_do_hypercall(u64 control, void *inputaddr, void *outputaddr);
 u64 hv_do_fast_hypercall8(u64 control, u64 input8);
 u64 hv_do_fast_hypercall16(u64 control, u64 input1, u64 input2);
+static inline bool hv_parent_partition(void);
 
 bool hv_isolation_type_snp(void);
 bool hv_isolation_type_tdx(void);
@@ -119,6 +120,11 @@ static inline bool hv_result_success(u64 status)
 	return hv_result(status) == HV_STATUS_SUCCESS;
 }
 
+static inline bool hv_result_timeout(u64 status)
+{
+	return hv_result(status) == HV_STATUS_TIMEOUT;
+}
+
 static inline unsigned int hv_repcomp(u64 status)
 {
 	/* Bits [43:32] of status have 'Reps completed' data. */
@@ -126,45 +132,63 @@ static inline unsigned int hv_repcomp(u64 status)
 			 HV_HYPERCALL_REP_COMP_OFFSET;
 }
 
-/*
- * Rep hypercalls. Callers of this functions are supposed to ensure that
- * rep_count, varhead_size, and rep_start comply with Hyper-V hypercall
- * definition.
- */
-static inline u64 hv_do_rep_hypercall_ex(u16 code, u16 rep_count,
-					 u16 varhead_size, u16 rep_start,
-					 void *input, void *output)
+static inline u64 hv_do_rep_hypercall_reg(u16 code, u16 rep_count,
+					  u16 varhead_size, u16 rep_start,
+					  void *input, void *output)
 {
 	u64 control = code;
-	u64 status;
-	u16 rep_comp;
 
 	control |= (u64)varhead_size << HV_HYPERCALL_VARHEAD_OFFSET;
 	control |= (u64)rep_count << HV_HYPERCALL_REP_COMP_OFFSET;
 	control |= (u64)rep_start << HV_HYPERCALL_REP_START_OFFSET;
 
-	do {
+	return hv_do_hypercall(control, input, output);
+}
+
+static inline u64 hv_do_rep_hypercall_cvm(u16 code, u16 rep_count,
+					  u16 varhead_size, u16 rep_start,
+					  void *input, void *output)
+{
+	u64 status, control = code;
+	u16 rep_comp = 0;
+
+	control |= (u64)varhead_size << HV_HYPERCALL_VARHEAD_OFFSET;
+	control |= (u64)rep_count << HV_HYPERCALL_REP_COMP_OFFSET;
+	control |= (u64)rep_start << HV_HYPERCALL_REP_START_OFFSET;
+
+	for (;;) {
 		status = hv_do_hypercall(control, input, output);
-		if (!hv_result_success(status))
+
+		if (!hv_result_timeout(status))
 			return status;
 
 		rep_comp = hv_repcomp(status);
-
 		control &= ~HV_HYPERCALL_REP_START_MASK;
 		control |= (u64)rep_comp << HV_HYPERCALL_REP_START_OFFSET;
 
 		touch_nmi_watchdog();
-	} while (rep_comp < rep_count);
+	}
 
 	return status;
 }
 
-/* For the typical case where rep_start is 0 */
+/*
+ * Rep hypercalls for HW confidential VMs return back when timeouts occur,
+ * whereas for regular VMs they return only on success or failure. In case
+ * of successful completion, entire rep_count is done. But a hypercall could
+ * fail with partial completions, hence callers must always check that
+ * in case of failure. Lastly, a rep_count value of 0 is allowed for some
+ * hypercalls.
+ */
 static inline u64 hv_do_rep_hypercall(u16 code, u16 rep_count, u16 varhead_size,
 				      void *input, void *output)
 {
-	return hv_do_rep_hypercall_ex(code, rep_count, varhead_size, 0,
-				      input, output);
+	if (!hv_isolation_hw_cvm())
+		return hv_do_rep_hypercall_reg(code, rep_count, varhead_size, 0,
+					       input, output);
+	else
+		return hv_do_rep_hypercall_cvm(code, rep_count, varhead_size, 0,
+					       input, output);
 }
 
 /* Generate the guest OS identifier as described in the Hyper-V TLFS */
