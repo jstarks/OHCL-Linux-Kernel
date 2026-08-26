@@ -5,6 +5,7 @@
  *
  * Authors:
  * 	Anirudh Rayabharam (Microsoft) <anirudh@anirudhrb.com>
+ *  Souradeep Chakrabarti <schakrabarti@microsoft.com>
  */
 
 #include <linux/pci.h>
