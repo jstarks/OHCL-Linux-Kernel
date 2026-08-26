@@ -3187,8 +3187,12 @@ static long mshv_ioctl_process_pt_flags(void __user *user_arg, u64 *pt_flags,
 		 */
 		disabled_xsave->as_uint64 = 0;
 
-		if (mshv_field_nonzero(args, pt_rsvd2))
-			return -EINVAL;
+		/*
+		 * Do not reject pt_rsvd2 on ARM64. Older ARM64 mshv bindings
+		 * used a shorter v2 structure, so copying the current full
+		 * structure can read adjacent userspace bytes into this unused
+		 * field.
+		 */
 #endif
 	}
 

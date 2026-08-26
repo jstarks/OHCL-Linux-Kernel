@@ -343,8 +343,13 @@ static void mshv_make_device_usable(struct pci_dev *pdev, int vector,
 	u16 pcicmd;
 	struct vfio_pci_core_device *coredev = dev_get_drvdata(&pdev->dev);
 
+	/*
+	 * Accept vfio-pci and its variant drivers (e.g. nvgrace_gpu_vfio_pci),
+	 * which all embed a struct vfio_pci_core_device as drvdata.
+	 */
 	if (pdev->dev.driver == NULL ||
-	    strcmp(pdev->dev.driver->name, "vfio-pci") != 0) {
+	    (strstr(pdev->dev.driver->name, "vfio-pci") == NULL &&
+	     strstr(pdev->dev.driver->name, "vfio_pci") == NULL)) {
 		pr_err("Hyper-V: irqbypass: non vfio device %s\n",
 		       pci_name(pdev));
 		return;
@@ -689,8 +694,13 @@ static void mshv_arm_make_device_usable(struct pci_dev *pdev, unsigned int lirq,
 	struct irq_data *parent;
 	u16 pcicmd;
 
+	/*
+	 * Accept vfio-pci and its variant drivers (e.g. nvgrace_gpu_vfio_pci),
+	 * which all embed a struct vfio_pci_core_device as drvdata.
+	 */
 	if (pdev->dev.driver == NULL ||
-	    strcmp(pdev->dev.driver->name, "vfio-pci") != 0) {
+	    (strstr(pdev->dev.driver->name, "vfio-pci") == NULL &&
+	     strstr(pdev->dev.driver->name, "vfio_pci") == NULL)) {
 		pr_err("Hyper-V: irqbypass: non vfio device %s\n",
 		       pci_name(pdev));
 		return;
