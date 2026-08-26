@@ -8,7 +8,6 @@
  */
 
 #include <linux/pci.h>
-#include <linux/iommu.h>
 #include <linux/irq.h>
 #include <linux/irqchip/arm-gic-v3.h>
 #include <linux/irqdomain.h>
@@ -17,15 +16,6 @@
 #include <asm/mshyperv.h>
 
 #include "irq-gic-common.h"
-
-/*
- * Currently, direct attach must use logical device type and vice versa. Since
- * vfio needs to bind irq at the very start before we know guest cpu/irq, we
- * pick some default cpu/irq, and after the VM starts retarget will move it
- * to relevant cpu and irq.
- */
-#define HV_LOGDEV_DEF_CPU 0
-#define HV_LOGDEV_DEF_IRQ 32
 
 static int hv_map_interrupt_hcall(u64 ptid, union hv_device_id device_id,
 				  bool level, int cpu, int vector,
@@ -42,11 +32,6 @@ static int hv_map_interrupt_hcall(u64 ptid, union hv_device_id device_id,
 
 	input = *this_cpu_ptr(hyperv_pcpu_input_arg);
 	output = *this_cpu_ptr(hyperv_pcpu_output_arg);
-
-	if (device_id.device_type == HV_DEVICE_TYPE_LOGICAL) {
-		cpu = HV_LOGDEV_DEF_CPU;
-		vector = HV_LOGDEV_DEF_IRQ;
-	}
 
 	memset(input, 0, sizeof(*input));
 	input->partition_id = ptid;
@@ -225,17 +210,18 @@ static u64 hv_build_devid_type_logical(struct pci_dev *pdev)
 /*
  * Build device id after the device has been attached.
  *
- * NB: 6.18 already provides a generic hv_build_devid_oftype() (built only on
- * x86 via CONFIG_HYPERV_IOMMU; a return-0 stub elsewhere). Keep a file-local
- * implementation here for the arm64 root partition rather than colliding with
- * the generic declaration.
+ * NB: 6.18 already provides a generic hv_build_devid_oftype() (built on x86 via
+ * CONFIG_HYPERV_IOMMU, and on arm64 via CONFIG_HYPERV_IOMMU_ARM). That generic
+ * builder returns 0 for the HV_DEVICE_TYPE_PCI path on non-x86, so keep a
+ * file-local implementation here for the arm64 root partition that also builds
+ * the PCI device id.
  */
 static u64 hv_pci_build_devid_oftype(struct pci_dev *pdev,
 				     enum hv_device_type type)
 {
 	if (type == HV_DEVICE_TYPE_LOGICAL) {
 		if (hv_l1vh_partition())
-			return 0;
+			return hv_pci_vmbus_device_id(pdev);
 		else
 			return hv_build_devid_type_logical(pdev);
 	} else if (type == HV_DEVICE_TYPE_PCI)
@@ -282,7 +268,17 @@ int hv_map_msi_interrupt(struct irq_data *data,
 	cpu = cpumask_first_and(affinity, cpu_online_mask);
 	hv_devid.as_uint64 = hv_build_irq_devid(pdev);
 
-	ptid = hv_current_partition_id;
+	/*
+	 * For a passthrough (attached) device the interrupt must be mapped in
+	 * the guest partition that owns it; fetch that partition id from the
+	 * iommu driver. Devices owned by the root/L1VH dom0 itself use the
+	 * current (root) partition id.
+	 */
+	if (hv_devid.device_type == HV_DEVICE_TYPE_LOGICAL &&
+	    hv_pcidev_is_attached_dev(pdev))
+		ptid = hv_get_current_partid();
+	else
+		ptid = hv_current_partition_id;
 
 	/* prints error in case of failure */
 	res = hv_map_interrupt(ptid, hv_devid, false, cpu, vector,
@@ -314,7 +310,22 @@ static int hv_unmap_interrupt(union hv_device_id hv_devid,
 
 	memset(input, 0, sizeof(*input));
 
-	input->partition_id = hv_current_partition_id;
+	if (hv_devid.device_type == HV_DEVICE_TYPE_LOGICAL) {
+		u64 ptid = hv_get_current_partid();
+
+		/*
+		 * During cleanup the VMM process is dead and mshv has already
+		 * removed its pid->partid mapping. Fall back to the root
+		 * partition id; the hypervisor still tracks the mapping by
+		 * device_id + interrupt_entry, so this lets the unmap succeed
+		 * and prevents per-vector leaks that later return
+		 * HV_STATUS_OBJECT_IN_USE on remap.
+		 */
+		input->partition_id = (ptid == HV_PARTITION_ID_INVALID) ?
+				      hv_current_partition_id : ptid;
+	} else {
+		input->partition_id = hv_current_partition_id;
+	}
 
 	input->device_id = hv_devid.as_uint64;
 	intr_entry = &input->interrupt_entry;
@@ -462,6 +473,37 @@ static void hv_irq_unmask(struct irq_data *irqd)
 }
 
 /*
+ * Stub used as the irqchip .irq_compose_msi_msg callback so that the MSI/MSI-X
+ * allocation path (e.g. vfio-pci enable) does NOT issue a
+ * HVCALL_MAP_DEVICE_INTERRUPT for passthrough devices. On root the correct
+ * guest partition_id / vector / vCPU set are only known later, at mshv
+ * irqfd-assign time, where mshv_map_interrupt() calls the real
+ * hv_irq_compose_msi_msg().
+ */
+static void hv_irq_compose_msi_msg_stub(struct irq_data *data,
+					struct msi_msg *msg)
+{
+	struct msi_desc *msidesc = irq_data_get_msi_desc(data);
+	struct pci_dev *pdev = msi_desc_to_pci_dev(msidesc);
+
+	/*
+	 * For VFIO-passthrough devices (in an attached_dom domain), defer the
+	 * MAP to mshv_map_interrupt(), which fires at irqfd-assign time with
+	 * the guest's vector / target partid. Return a zero msi_msg here --
+	 * mshv will overwrite it via pci_write_msi_msg().
+	 *
+	 * For host-owned devices (dom0's own NVMe etc.), do the normal MAP so
+	 * the kernel programs valid MSI-X entries.
+	 */
+	if (pdev && hv_pcidev_is_attached_dev(pdev)) {
+		memset(msg, 0, sizeof(*msg));
+		return;
+	}
+
+	hv_irq_compose_msi_msg(data, msg);
+}
+
+/*
  * IRQ Chip for MSI PCI/PCI-X/PCI-Express Devices,
  * which implement the MSI or MSI-X Capability Structure.
  */
@@ -472,7 +514,7 @@ static struct irq_chip hv_pci_msi_controller = {
 	.irq_ack		= irq_chip_ack_parent,
 	.irq_eoi		= irq_chip_eoi_parent,
 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
-	.irq_compose_msi_msg	= hv_irq_compose_msi_msg,
+	.irq_compose_msi_msg	= hv_irq_compose_msi_msg_stub,
 	.irq_set_affinity	= hv_irq_set_affinity,
 	.flags			= IRQCHIP_SKIP_SET_WAKE,
 };
@@ -650,6 +692,11 @@ static struct irq_domain * __init hv_create_pci_msi_domain(struct irq_domain *pa
 
 static int __init hv_pci_msi_init(void)
 {
+	/*
+	 * Only the Microsoft Hypervisor root partition owns the PCI MSI
+	 * irqdomain. On bare metal (no MSHV) hyperv_pcpu_input_arg is never
+	 * set up, so installing the Hyper-V MSI chip will cause panic.
+	 */
 	if (!hv_root_partition())
 		return 0;
 

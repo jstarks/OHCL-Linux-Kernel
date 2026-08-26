@@ -14,6 +14,8 @@
 #include "mshv.h"
 #include "mshv_root.h"
 
+struct hv_interrupt_entry;
+
 /* struct to contain list of irqfds sharing an irq. Updates are protected by
  * partition.irqfds.resampler_lock
  */
@@ -40,6 +42,17 @@ struct mshv_irqfd {
 	struct hlist_node		     irqfd_resampler_hnode;
 	struct irq_bypass_consumer	     irqfd_bypass_cons;
 	struct irq_bypass_producer	    *irqfd_bypass_prod;
+	/*
+	 * Tracks an active HVCALL_MAP_DEVICE_INTERRUPT mapping for this irqfd
+	 * (ARM64 passthrough). Owned by mshv (allocated/freed in
+	 * mshv_pthru_dev_irq_remap()/mshv_irqfd_drop_hv_map()). It is NOT stored
+	 * in irq_data->chip_data because that field is owned by the underlying
+	 * irqchip (e.g. GIC-ITS on ARM64) and may be cleared/replaced across
+	 * VFIO free_irq()/request_irq() cycles, which would leak the hv mapping.
+	 */
+	struct hv_interrupt_entry	    *irqfd_hv_entry;
+	u64				     irqfd_hv_devid;
+	u64				     irqfd_hv_ptid;
 };
 
 void mshv_eventfd_init(struct mshv_partition *partition);
