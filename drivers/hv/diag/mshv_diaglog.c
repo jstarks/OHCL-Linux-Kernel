@@ -555,10 +555,14 @@ int __init mshv_diaglog_init(void)
 	tot_pages = hv_logbuf_info.buffer_count *
 				hv_logbuf_info.buffer_size_in_pages;
 
-	if (should_alloc_diag_pages())
+	if (should_alloc_diag_pages()) {
 		ret = alloc_and_map_diag_buffers(tot_pages, &diag_ppages);
-	else
+	} else if (hv_root_partition()) {
 		ret = map_diag_buffers(tot_pages, &diag_ppages);
+	} else {
+		pr_err("%s: diagnostics log is not supported for this partition\n", __func__);
+		ret = -EOPNOTSUPP;
+	}
 
 	if (ret)
 		return ret;
