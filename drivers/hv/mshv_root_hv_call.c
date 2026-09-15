@@ -240,19 +240,14 @@ static int hv_do_map_gpa_hcall(u64 partition_id, u64 gfn, u64 page_struct_count,
 	struct hv_input_map_gpa_pages *input_page;
 	u64 status, *pfnlist;
 	unsigned long irq_flags, large_shift = 0;
-	int i, ret = 0, done = 0;
+	int ret = 0, done = 0;
 	u64 page_count = page_struct_count;
 
 	if (page_count == 0)
 		return 0;
 
-	if (mmio_mfn) {
-		if (pages)
-			return -EINVAL;
-		for (i = 0; i < page_struct_count; i++)
-			if (page_is_ram(mmio_mfn + i))
-				return -EINVAL;
-	}
+	if (mmio_mfn && pages)
+		return -EINVAL;
 
 	if (flags & HV_MAP_GPA_LARGE_PAGE) {
 		if (!HV_PAGE_COUNT_2M_ALIGNED(page_count))
