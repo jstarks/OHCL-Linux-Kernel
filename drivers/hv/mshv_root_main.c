@@ -58,6 +58,7 @@ enum hv_scheduler_type hv_scheduler_type;
 /* Once we implement the fast extended hypercall ABI they can go away. */
 static void * __percpu *root_scheduler_input;
 static void * __percpu *root_scheduler_output;
+/* Cache only an observed rejection, not the presence of L1VH itself. */
 static bool root_scheduler_enable_caller_interrupts __read_mostly = true;
 
 static long mshv_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg);
@@ -448,6 +449,11 @@ mshv_vp_dispatch(struct mshv_vp *vp, u32 flags,
 		flags |= HV_DISPATCH_VP_FLAG_ENABLE_CALLER_INTERRUPTS;
 	input->flags = flags;
 
+	/*
+	 * A signal or reschedule IPI must not be consumed between the last
+	 * work check and dispatch. The hypervisor enables caller interrupts
+	 * and checks for pending interrupts as part of the flagged call.
+	 */
 	local_irq_disable();
 	if (xfer_to_guest_mode_work_pending()) {
 		local_irq_enable();
@@ -512,7 +518,8 @@ mshv_vp_dispatch(struct mshv_vp *vp, u32 flags,
 #endif
 				      status);
 
-	*res = *output;
+	if (hv_result_success(status))
+		*res = *output;
 	preempt_enable();
 
 	if (enable_caller_interrupts && hv_l1vh_partition() &&
@@ -666,6 +673,7 @@ static long mshv_run_vp_with_root_scheduler(struct mshv_vp *vp)
 			flags |= HV_DISPATCH_VP_FLAG_SCAN_INTERRUPT_INJECTION;
 
 		ret = mshv_vp_dispatch(vp, flags, &output);
+		/* Neither a work check nor flag rejection consumes the intercept. */
 		if (ret > 0)
 			continue;
 		if (ret)
