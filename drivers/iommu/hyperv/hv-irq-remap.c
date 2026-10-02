@@ -186,44 +186,54 @@ struct hyperv_root_ir_data {
 	struct hv_interrupt_entry entry;
 };
 
+static int hyperv_root_ir_unmap(struct hyperv_root_ir_data *data)
+{
+	int ret;
+
+	if (data->entry.source != HV_DEVICE_TYPE_IOAPIC ||
+	    !data->entry.ioapic_rte.as_uint64)
+		return 0;
+
+	ret = hv_unmap_ioapic_interrupt(data->ioapic_id, &data->entry);
+	if (!ret)
+		memset(&data->entry, 0, sizeof(data->entry));
+
+	return ret;
+}
+
+static int hyperv_root_ir_map(struct irq_data *irq_data)
+{
+	struct hyperv_root_ir_data *data = irq_data->chip_data;
+	struct irq_cfg *cfg = irqd_cfg(irq_data);
+	struct hv_interrupt_entry entry;
+	const struct cpumask *affinity;
+	int cpu, ret;
+
+	affinity = irq_data_get_effective_affinity_mask(irq_data);
+	cpu = cpumask_first_and(affinity, cpu_online_mask);
+
+	ret = hyperv_root_ir_unmap(data);
+	if (ret)
+		return ret;
+
+	ret = hv_map_ioapic_interrupt(data->ioapic_id, data->is_level, cpu,
+				     cfg->vector, &entry);
+	if (ret)
+		return ret;
+	data->entry = entry;
+
+	return 0;
+}
+
 static void
 hyperv_root_ir_compose_msi_msg(struct irq_data *irq_data, struct msi_msg *msg)
 {
 	struct hyperv_root_ir_data *data = irq_data->chip_data;
-	struct hv_interrupt_entry entry;
-	const struct cpumask *affinity;
 	struct IO_APIC_route_entry e;
-	struct irq_cfg *cfg;
-	int cpu, ioapic_id;
-	u32 vector;
-
-	cfg = irqd_cfg(irq_data);
-	affinity = irq_data_get_effective_affinity_mask(irq_data);
-	cpu = cpumask_first_and(affinity, cpu_online_mask);
-
-	vector = cfg->vector;
-	ioapic_id = data->ioapic_id;
-
-	if (data->entry.source == HV_DEVICE_TYPE_IOAPIC
-	    && data->entry.ioapic_rte.as_uint64) {
-		entry = data->entry;
-
-		(void)hv_unmap_ioapic_interrupt(ioapic_id, &entry);
-
-		data->entry.ioapic_rte.as_uint64 = 0;
-		data->entry.source = 0; /* Invalid source */
-	}
-
-
-	if (hv_map_ioapic_interrupt(ioapic_id, data->is_level, cpu,
-				    vector, &entry))
-		return;
-
-	data->entry = entry;
 
 	/* Turn it into an IO_APIC_route_entry, and generate MSI MSG. */
-	e.w1 = entry.ioapic_rte.low_uint32;
-	e.w2 = entry.ioapic_rte.high_uint32;
+	e.w1 = data->entry.ioapic_rte.low_uint32;
+	e.w2 = data->entry.ioapic_rte.high_uint32;
 
 	memset(msg, 0, sizeof(*msg));
 	msg->arch_data.vector = e.vector;
@@ -242,6 +252,10 @@ static int hyperv_root_ir_set_affinity(struct irq_data *data,
 
 	ret = parent->chip->irq_set_affinity(parent, mask, force);
 	if (ret < 0 || ret == IRQ_SET_MASK_OK_DONE)
+		return ret;
+
+	ret = hyperv_root_ir_map(data);
+	if (ret)
 		return ret;
 
 	vector_schedule_cleanup(cfg);
@@ -299,7 +313,6 @@ static void hyperv_root_irq_remapping_free(struct irq_domain *domain,
 {
 	struct irq_data *irq_data;
 	struct hyperv_root_ir_data *data;
-	struct hv_interrupt_entry *e;
 	int i;
 
 	for (i = 0; i < nr_irqs; i++) {
@@ -307,13 +320,7 @@ static void hyperv_root_irq_remapping_free(struct irq_domain *domain,
 
 		if (irq_data && irq_data->chip_data) {
 			data = irq_data->chip_data;
-			e = &data->entry;
-
-			if (e->source == HV_DEVICE_TYPE_IOAPIC &&
-			    e->ioapic_rte.as_uint64)
-				(void)hv_unmap_ioapic_interrupt(data->ioapic_id,
-								&data->entry);
-
+			hyperv_root_ir_unmap(data);
 			kfree(data);
 		}
 	}
@@ -321,8 +328,26 @@ static void hyperv_root_irq_remapping_free(struct irq_domain *domain,
 	irq_domain_free_irqs_common(domain, virq, nr_irqs);
 }
 
+static int hyperv_root_irq_remapping_activate(struct irq_domain *domain,
+					     struct irq_data *irq_data,
+					     bool reserve)
+{
+	return hyperv_root_ir_map(irq_data);
+}
+
+static void hyperv_root_irq_remapping_deactivate(struct irq_domain *domain,
+					       struct irq_data *irq_data)
+{
+	struct hyperv_root_ir_data *data = irq_data->chip_data;
+
+	/* Release the hypervisor mapping before the parent recycles the vector. */
+	hyperv_root_ir_unmap(data);
+}
+
 static const struct irq_domain_ops hyperv_root_ir_domain_ops = {
 	.select = hyperv_irq_remapping_select,
 	.alloc = hyperv_root_irq_remapping_alloc,
 	.free = hyperv_root_irq_remapping_free,
+	.activate = hyperv_root_irq_remapping_activate,
+	.deactivate = hyperv_root_irq_remapping_deactivate,
 };
