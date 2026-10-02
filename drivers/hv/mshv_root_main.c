@@ -18,6 +18,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/mm.h>
 #include <linux/io.h>
+#include <linux/irqflags.h>
 #include <linux/cpuhotplug.h>
 #include <linux/random.h>
 #include <asm/mshyperv.h>
@@ -57,6 +58,7 @@ enum hv_scheduler_type hv_scheduler_type;
 /* Once we implement the fast extended hypercall ABI they can go away. */
 static void * __percpu *root_scheduler_input;
 static void * __percpu *root_scheduler_output;
+static bool root_scheduler_enable_caller_interrupts __read_mostly = true;
 
 static long mshv_dev_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg);
 static int mshv_dev_open(struct inode *inode, struct file *filp);
@@ -413,12 +415,22 @@ static long mshv_run_vp_with_hyp_scheduler(struct mshv_vp *vp)
 	return 0;
 }
 
+/*
+ * Returns 0 after dispatch, 1 to retry without consuming the pending intercept,
+ * or -errno.
+ */
 static int
 mshv_vp_dispatch(struct mshv_vp *vp, u32 flags,
 		 struct hv_output_dispatch_vp *res)
 {
 	struct hv_input_dispatch_vp *input;
 	struct hv_output_dispatch_vp *output;
+	bool enable_caller_interrupts =
+		READ_ONCE(root_scheduler_enable_caller_interrupts);
+#if defined(CONFIG_ARM64)
+	unsigned long daif = 0;
+	bool use_pmr = system_uses_irq_prio_masking();
+#endif
 	u64 status;
 
 	preempt_disable();
@@ -432,15 +444,62 @@ mshv_vp_dispatch(struct mshv_vp *vp, u32 flags,
 	input->vp_index = vp->vp_index;
 	input->time_slice = 0; /* Run forever until something happens */
 	input->spec_ctrl = 0; /* TODO: set sensible flags */
+	if (enable_caller_interrupts)
+		flags |= HV_DISPATCH_VP_FLAG_ENABLE_CALLER_INTERRUPTS;
 	input->flags = flags;
+
+	local_irq_disable();
+	if (xfer_to_guest_mode_work_pending()) {
+		local_irq_enable();
+		preempt_enable();
+		return 1;
+	}
 
 	vtime_account_guest_enter();
 
 	vp->run.flags.root_sched_dispatched = 1;
+
+	/*
+	 * The hypervisor can return with IRQs enabled, so update tracing before
+	 * entry, while Linux still reports IRQs disabled (before the PMR handoff).
+	 */
+	trace_hardirqs_on();
+#if defined(CONFIG_ARM64)
+	if (enable_caller_interrupts && use_pmr) {
+		/*
+		 * The hypervisor only clears PSTATE.I. Transfer IRQ masking
+		 * from PMR to DAIF so that clearing I makes IRQs deliverable.
+		 * Use the normal IRQ-on PMR value, since an IRQ can be taken
+		 * as soon as the hypercall returns.
+		 */
+		daif = __daif_local_irq_save();
+		__pmr_local_irq_enable();
+	}
+#endif
+	/*
+	 * Older L1VH hosts need IRQs enabled before entry. Keep this racy
+	 * fallback as late as possible, with preemption still disabled.
+	 */
+	if (!enable_caller_interrupts)
+		raw_local_irq_enable();
+
 	status = hv_do_hypercall(HVCALL_DISPATCH_VP, input, output);
+
+	/*
+	 * Early hypercall failures can leave IRQs disabled. Normalize both
+	 * hardware and tracing state regardless of how the hypercall returned.
+	 */
+	raw_local_irq_disable();
+#if defined(CONFIG_ARM64)
+	/* PMR must mask IRQs again before restoring DAIF. */
+	if (enable_caller_interrupts && use_pmr)
+		__daif_local_irq_restore(daif);
+#endif
+	trace_hardirqs_off();
 	vp->run.flags.root_sched_dispatched = 0;
 
 	vtime_account_guest_exit();
+	local_irq_enable();
 
 	trace_mshv_hvcall_dispatch_vp(vp->vp_partition->pt_id,
 				      vp->vp_index, flags,
@@ -455,6 +514,18 @@ mshv_vp_dispatch(struct mshv_vp *vp, u32 flags,
 
 	*res = *output;
 	preempt_enable();
+
+	if (enable_caller_interrupts && hv_l1vh_partition() &&
+	    hv_result(status) == HV_STATUS_FEATURE_UNAVAILABLE) {
+		/*
+		 * L1VH rejects this flag before dispatching or clearing
+		 * intercept suspend. Retry with a fresh pending-work check.
+		 */
+		WRITE_ONCE(root_scheduler_enable_caller_interrupts, false);
+		pr_warn_once("mshv: L1VH cannot enable caller interrupts; "
+			     "falling back to VP dispatch with a signal race\n");
+		return 1;
+	}
 
 	if (!hv_result_success(status))
 		vp_err(vp, "%s: status %s\n", __func__,
@@ -572,7 +643,7 @@ static long mshv_run_vp_with_root_scheduler(struct mshv_vp *vp)
 			return ret;
 	}
 
-	do {
+	for (;;) {
 		u32 flags = 0;
 		struct hv_output_dispatch_vp output;
 
@@ -595,6 +666,8 @@ static long mshv_run_vp_with_root_scheduler(struct mshv_vp *vp)
 			flags |= HV_DISPATCH_VP_FLAG_SCAN_INTERRUPT_INJECTION;
 
 		ret = mshv_vp_dispatch(vp, flags, &output);
+		if (ret > 0)
+			continue;
 		if (ret)
 			break;
 
@@ -639,7 +712,10 @@ static long mshv_run_vp_with_root_scheduler(struct mshv_vp *vp)
 						HV_VP_DISPATCH_EVENT_INTERCEPT)
 				vp->run.flags.intercept_suspend = 1;
 		}
-	} while (!vp->run.flags.intercept_suspend);
+
+		if (vp->run.flags.intercept_suspend)
+			break;
+	}
 
 	if (!vp->run.flags.intercept_suspend) {
 		int rc = mshv_vp_set_explicit_suspend(vp);
