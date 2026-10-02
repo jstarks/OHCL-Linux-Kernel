@@ -89,6 +89,19 @@ int hv_call_withdraw_memory(u64 count, int node, u64 partition_id)
 	return hv_result_to_errno(status);
 }
 
+#ifdef CONFIG_X86_64
+/* Build 26100 predates the third processor-feature bank in the wire ABI. */
+struct hv_input_create_partition_26100 {
+	u64 flags;
+	struct hv_proximity_domain_info proximity_domain_info;
+	u32 compatibility_version;
+	u32 padding;
+	u64 disabled_processor_features[2];
+	union hv_partition_processor_xsave_features disabled_xsave;
+	union hv_partition_isolation_properties isolation_properties;
+} __packed;
+#endif
+
 int hv_call_create_partition(u64 flags,
 			     struct hv_partition_creation_properties creation_properties,
 			     union hv_partition_isolation_properties isolation_properties,
@@ -99,6 +112,16 @@ int hv_call_create_partition(u64 flags,
 	u64 status;
 	int ret;
 	unsigned long irq_flags;
+#ifdef CONFIG_X86_64
+	union hv_hypervisor_version_info version;
+
+	ret = hv_get_hypervisor_version(&version);
+	if (ret)
+		return ret;
+	if (version.build_number == 26100 &&
+	    creation_properties.disabled_processor_features.as_uint64[2] != U64_MAX)
+		return -EOPNOTSUPP;
+#endif
 
 	do {
 		local_irq_save(irq_flags);
@@ -115,6 +138,21 @@ int hv_call_create_partition(u64 flags,
 		memcpy(&input->isolation_properties, &isolation_properties,
 		       sizeof(isolation_properties));
 
+#ifdef CONFIG_X86_64
+		if (version.build_number == 26100) {
+			struct hv_input_create_partition_26100 *legacy = (void *)input;
+
+			memset(legacy, 0, sizeof(*legacy));
+			legacy->flags = flags;
+			legacy->compatibility_version = HV_COMPATIBILITY_21_H2;
+			memcpy(legacy->disabled_processor_features,
+			       creation_properties.disabled_processor_features.as_uint64,
+			       sizeof(legacy->disabled_processor_features));
+			legacy->disabled_xsave =
+				creation_properties.disabled_processor_xsave_features;
+			legacy->isolation_properties = isolation_properties;
+		}
+#endif
 		status = hv_do_hypercall(HVCALL_CREATE_PARTITION,
 					 input, output);
 
@@ -154,6 +192,8 @@ int hv_call_initialize_partition(u64 partition_id)
 	} while (!ret);
 
 	trace_mshv_hvcall_initialize_partition(partition_id, status);
+	if (!hv_result_success(status))
+		hv_status_err(status, "initializing partition %#llx\n", partition_id);
 
 	return ret;
 }
