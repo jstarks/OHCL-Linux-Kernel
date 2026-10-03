@@ -216,7 +216,7 @@ static void mshv_do_guest_irq_retarget(u64 partid, struct mshv_irqfd *irqfd)
 		return;
 
 	inte = irqdata->chip_data;
-	if (inte == NULL)
+	if (inte == NULL || inte->source != HV_INTERRUPT_SOURCE_MSI)
 		return;
 
 	hv_devid.as_uint64 = hv_devid_from_pdev(pdev);
@@ -295,16 +295,19 @@ static int mshv_unmap_device_interrupt(union hv_device_id hv_devid,
 static int mshv_chk_unmap_irq(union hv_device_id hv_devid,
 			      struct irq_data *irqdata)
 {
+	struct hv_interrupt_entry *entry = irqdata->chip_data;
 	int rc;
 
-	if (irqdata->chip_data == NULL)
+	if (!entry)
 		return 0;
 
-	rc = mshv_unmap_device_interrupt(hv_devid, irqdata->chip_data);
-	if (rc)
-		return rc;
+	if (entry->source == HV_INTERRUPT_SOURCE_MSI) {
+		rc = mshv_unmap_device_interrupt(hv_devid, entry);
+		if (rc)
+			return rc;
+	}
 
-	kfree(irqdata->chip_data);
+	kfree(entry);
 	irqdata->chip_data = NULL;
 
 	return 0;

@@ -11,6 +11,7 @@
 #include <linux/irq.h>
 #include <linux/export.h>
 #include <linux/irqchip/irq-msi-lib.h>
+#include <asm/irq_vectors.h>
 #include <asm/mshyperv.h>
 
 static int hv_map_interrupt(union hv_device_id hv_devid, bool level,
@@ -216,73 +217,13 @@ static void entry_to_msi_msg(struct hv_interrupt_entry *entry,
 	msg->data = entry->msi_entry.data.as_uint32;
 }
 
-int hv_unmap_msi_interrupt(struct pci_dev *pdev,
-			   struct hv_interrupt_entry *irq_entry);
-
 static void hv_irq_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 {
-	struct hv_interrupt_entry *stored_entry;
-	struct irq_cfg *cfg = irqd_cfg(data);
-	struct msi_desc *msidesc;
-	struct pci_dev *pdev;
-	int ret;
+	struct hv_interrupt_entry *entry = data->chip_data;
 
-	msidesc = irq_data_get_msi_desc(data);
-	pdev = msi_desc_to_pci_dev(msidesc);
-
-	if (!cfg) {
-		pr_debug("%s: cfg is NULL", __func__);
-		return;
-	}
-
-	/*
-	 * For direct attached devices, we cannot map interrupts in the
-	 * hypervisor because it will not allow it until we have guest target
-	 * vcpu and vector. So defer it until irqbypass. Also, do the same
-	 * for domain attached devices for simplicity.
-	 */
-	if (hv_pcidev_is_pthru_dev(pdev)) {
-		if (data->chip_data)
-			entry_to_msi_msg(data->chip_data, msg);
-		else
-			memset(msg, 0, sizeof(struct msi_msg));
-		return;
-	}
-
-	if (data->chip_data) {
-		/*
-		 * This interrupt is already mapped. Let's unmap first.
-		 *
-		 * We don't use retarget interrupt hypercalls here because
-		 * Microsoft Hypervisor doesn't allow root to change the vector
-		 * or specify VPs outside of the set that is initially used
-		 * during mapping.
-		 */
-		stored_entry = data->chip_data;
-		data->chip_data = NULL;
-
-		ret = hv_unmap_msi_interrupt(pdev, stored_entry);
-
-		kfree(stored_entry);
-
-		if (ret)
-			return;
-	}
-
-	stored_entry = kzalloc(sizeof(*stored_entry), GFP_ATOMIC);
-	if (!stored_entry) {
-		pr_debug("%s: failed to allocate chip data\n", __func__);
-		return;
-	}
-
-	ret = hv_map_msi_interrupt(data, stored_entry);
-	if (ret) {
-		kfree(stored_entry);
-		return;
-	}
-
-	data->chip_data = stored_entry;
-	entry_to_msi_msg(data->chip_data, msg);
+	memset(msg, 0, sizeof(*msg));
+	if (entry && entry->source == HV_INTERRUPT_SOURCE_MSI)
+		entry_to_msi_msg(entry, msg);
 }
 
 int hv_unmap_msi_interrupt(struct pci_dev *pdev,
@@ -295,24 +236,83 @@ int hv_unmap_msi_interrupt(struct pci_dev *pdev,
 }
 EXPORT_SYMBOL_GPL(hv_unmap_msi_interrupt);
 
-/* NB: during map, hv_interrupt_entry is saved via data->chip_data */
-static void hv_teardown_msi_irq(struct pci_dev *pdev, struct irq_data *irqd)
+static int hv_msi_unmap(struct irq_data *data)
 {
-	struct hv_interrupt_entry irq_entry;
-	struct msi_msg msg;
+	struct hv_interrupt_entry *entry = data->chip_data;
+	struct msi_desc *desc = irq_data_get_msi_desc(data);
+	int ret;
 
-	if (!irqd->chip_data) {
-		pr_debug("%s: no chip data\n!", __func__);
+	if (!entry || entry->source != HV_INTERRUPT_SOURCE_MSI)
+		return 0;
+
+	ret = hv_unmap_msi_interrupt(msi_desc_to_pci_dev(desc), entry);
+	if (!ret)
+		memset(entry, 0, sizeof(*entry));
+
+	return ret;
+}
+
+static int hv_msi_map(struct irq_data *data)
+{
+	struct hv_interrupt_entry *stored_entry = data->chip_data;
+	struct msi_desc *desc = irq_data_get_msi_desc(data);
+	struct hv_interrupt_entry entry;
+	int ret;
+
+	/* Passthrough mappings require the guest target supplied by irqbypass. */
+	if (hv_pcidev_is_pthru_dev(msi_desc_to_pci_dev(desc)))
+		return 0;
+
+	if (WARN_ON_ONCE(!stored_entry))
+		return -EINVAL;
+
+	/*
+	 * Retargeting cannot change the vector or select VPs outside the
+	 * original target set, so replace the mapping on affinity changes.
+	 */
+	ret = hv_msi_unmap(data);
+	if (ret)
+		return ret;
+
+	ret = hv_map_msi_interrupt(data, &entry);
+	if (!ret)
+		*stored_entry = entry;
+
+	return ret;
+}
+
+static int hv_irq_set_affinity(struct irq_data *data,
+			       const struct cpumask *mask, bool force)
+{
+	int ret;
+
+	ret = irq_chip_set_affinity_parent(data, mask, force);
+	if (ret < 0 || ret == IRQ_SET_MASK_OK_DONE)
+		return ret;
+
+	return hv_msi_map(data);
+}
+
+static int hv_msi_domain_activate(struct irq_domain *domain,
+				  struct irq_data *data, bool reserve)
+{
+	/* Reservation and managed shutdown have no usable device vector yet. */
+	if (irqd_cfg(data)->vector == MANAGED_IRQ_SHUTDOWN_VECTOR)
+		return 0;
+
+	return hv_msi_map(data);
+}
+
+static void hv_msi_domain_deactivate(struct irq_domain *domain,
+				     struct irq_data *data)
+{
+	struct msi_desc *desc = irq_data_get_msi_desc(data);
+
+	if (hv_pcidev_is_pthru_dev(msi_desc_to_pci_dev(desc)))
 		return;
-	}
 
-	irq_entry = *(struct hv_interrupt_entry *)irqd->chip_data;
-	entry_to_msi_msg(&irq_entry, &msg);
-
-	kfree(irqd->chip_data);
-	irqd->chip_data = NULL;
-
-	(void)hv_unmap_msi_interrupt(pdev, &irq_entry);
+	/* Release the mapping before the vector domain can recycle the vector. */
+	hv_msi_unmap(data);
 }
 
 /*
@@ -323,7 +323,7 @@ static struct irq_chip hv_pci_msi_controller = {
 	.name			= "HV-PCI-MSI",
 	.irq_ack		= irq_chip_ack_parent,
 	.irq_compose_msi_msg	= hv_irq_compose_msi_msg,
-	.irq_set_affinity	= irq_chip_set_affinity_parent,
+	.irq_set_affinity	= hv_irq_set_affinity,
 };
 
 static bool hv_init_dev_msi_info(struct device *dev, struct irq_domain *domain,
@@ -360,36 +360,53 @@ static struct msi_parent_ops hv_msi_parent_ops = {
 static int hv_msi_domain_alloc(struct irq_domain *d, unsigned int virq,
 			       unsigned int nr_irqs, void *arg)
 {
-	/*
-	 * TODO: The allocation bits of hv_irq_compose_msi_msg(), i.e.
-	 *	 everything except entry_to_msi_msg() should be in here.
-	 */
-	int ret;
+	struct hv_interrupt_entry *entry;
+	int i, ret;
 
 	ret = irq_domain_alloc_irqs_parent(d, virq, nr_irqs, arg);
 	if (ret)
 		return ret;
 
-	for (int i = 0; i < nr_irqs; ++i) {
+	for (i = 0; i < nr_irqs; ++i) {
+		/* Composition can run with the IRQ descriptor's raw lock held. */
+		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+		if (!entry) {
+			ret = -ENOMEM;
+			goto free_entries;
+		}
 		irq_domain_set_info(d, virq + i, 0, &hv_pci_msi_controller,
-				    NULL, handle_edge_irq, NULL, "edge");
+				    entry, handle_edge_irq, NULL, "edge");
 	}
 
 	return 0;
+
+free_entries:
+	while (i--) {
+		struct irq_data *data = irq_domain_get_irq_data(d, virq + i);
+
+		kfree(data->chip_data);
+	}
+	irq_domain_free_irqs_top(d, virq, nr_irqs);
+	return ret;
 }
 
 static void hv_msi_domain_free(struct irq_domain *d, unsigned int virq,
 			       unsigned int nr_irqs)
 {
 	for (int i = 0; i < nr_irqs; ++i) {
-		struct irq_data *irqd = irq_domain_get_irq_data(d, virq);
+		struct irq_data *irqd = irq_domain_get_irq_data(d, virq + i);
 		struct msi_desc *desc;
 
 		desc = irq_data_get_msi_desc(irqd);
-		if (!desc || !desc->irq || WARN_ON_ONCE(!dev_is_pci(desc->dev)))
+		if (!desc || !desc->irq || WARN_ON_ONCE(!dev_is_pci(desc->dev))) {
+			kfree(irqd->chip_data);
+			irqd->chip_data = NULL;
 			continue;
+		}
 
-		hv_teardown_msi_irq(to_pci_dev(desc->dev), irqd);
+		hv_msi_unmap(irqd);
+		kfree(irqd->chip_data);
+		irqd->chip_data = NULL;
 	}
 
 	irq_domain_free_irqs_top(d, virq, nr_irqs);
@@ -399,6 +416,8 @@ static const struct irq_domain_ops hv_msi_domain_ops = {
 	.select	= msi_lib_irq_domain_select,
 	.alloc	= hv_msi_domain_alloc,
 	.free	= hv_msi_domain_free,
+	.activate = hv_msi_domain_activate,
+	.deactivate = hv_msi_domain_deactivate,
 };
 
 struct irq_domain * __init hv_create_pci_msi_domain(void)
