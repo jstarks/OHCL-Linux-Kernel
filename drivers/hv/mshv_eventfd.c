@@ -983,7 +983,7 @@ static int mshv_try_assert_irq_fast(struct mshv_irqfd *irqfd,
 	    vp->vp_register_page->interrupt_vectors.as_uint64)
 		return -EBUSY;
 
-	wake_up(&vp->run.vp_suspend_queue);
+	swake_up_one(&vp->run.vp_suspend_queue);
 
 	return 0;
 }

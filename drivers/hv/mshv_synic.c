@@ -184,7 +184,7 @@ static void kick_vp(struct mshv_vp *vp)
 {
 	atomic64_inc(&vp->run.vp_signaled_count);
 	vp->run.kicked_by_hv = 1;
-	wake_up(&vp->run.vp_suspend_queue);
+	swake_up_one(&vp->run.vp_suspend_queue);
 }
 
 static void

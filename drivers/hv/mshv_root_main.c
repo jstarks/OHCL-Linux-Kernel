@@ -386,8 +386,8 @@ static long mshv_run_vp_with_hyp_scheduler(struct mshv_vp *vp)
 		return ret;
 	}
 
-	ret = wait_event_interruptible(vp->run.vp_suspend_queue,
-				       vp->run.kicked_by_hv == 1);
+	ret = swait_event_interruptible_exclusive(vp->run.vp_suspend_queue,
+						 vp->run.kicked_by_hv == 1);
 	if (ret) {
 		bool message_in_flight;
 
@@ -404,7 +404,8 @@ static long mshv_run_vp_with_hyp_scheduler(struct mshv_vp *vp)
 			return -EINTR;
 
 		/* Wait for the message in flight. */
-		wait_event(vp->run.vp_suspend_queue, vp->run.kicked_by_hv == 1);
+		swait_event_exclusive(vp->run.vp_suspend_queue,
+				      vp->run.kicked_by_hv == 1);
 	}
 
 	/*
@@ -609,10 +610,10 @@ mshv_vp_wait_for_hv_kick(struct mshv_vp *vp)
 {
 	int ret;
 
-	ret = wait_event_interruptible(vp->run.vp_suspend_queue,
-				       (vp->run.kicked_by_hv == 1 &&
-					!mshv_vp_dispatch_thread_blocked(vp)) ||
-				       mshv_vp_interrupt_pending(vp));
+	ret = swait_event_interruptible_exclusive(vp->run.vp_suspend_queue,
+				(vp->run.kicked_by_hv == 1 &&
+				 !mshv_vp_dispatch_thread_blocked(vp)) ||
+				mshv_vp_interrupt_pending(vp));
 	if (ret)
 		return -EINTR;
 
@@ -1662,7 +1663,7 @@ mshv_partition_ioctl_create_vp(struct mshv_partition *partition,
 	}
 
 	mutex_init(&vp->vp_mutex);
-	init_waitqueue_head(&vp->run.vp_suspend_queue);
+	init_swait_queue_head(&vp->run.vp_suspend_queue);
 	atomic64_set(&vp->run.vp_signaled_count, 0);
 
 	vp->vp_index = args.vp_index;
@@ -2834,8 +2835,8 @@ drain_vp_signals(struct mshv_vp *vp)
 	while (hv_signal_count != vp_signal_count) {
 		WARN_ON(hv_signal_count - vp_signal_count != 1);
 
-		if (wait_event_interruptible(vp->run.vp_suspend_queue,
-					     vp->run.kicked_by_hv == 1))
+		if (swait_event_interruptible_exclusive(vp->run.vp_suspend_queue,
+						       vp->run.kicked_by_hv == 1))
 			break;
 		vp->run.kicked_by_hv = 0;
 		vp_signal_count = atomic64_read(&vp->run.vp_signaled_count);

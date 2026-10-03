@@ -11,7 +11,7 @@
 #include <linux/semaphore.h>
 #include <linux/sched.h>
 #include <linux/srcu.h>
-#include <linux/wait.h>
+#include <linux/swait.h>
 #include <linux/hashtable.h>
 #include <linux/dev_printk.h>
 #include <linux/build_bug.h>
@@ -44,7 +44,11 @@ struct mshv_vp {
 			u64 reserved: 61;
 		} flags;
 		unsigned int kicked_by_hv;
-		wait_queue_head_t vp_suspend_queue;
+		/*
+		 * Woken from the hardirq SynIC callback. VP ioctls are serialized
+		 * by vp_mutex, and teardown waits only after the last reference.
+		 */
+		struct swait_queue_head vp_suspend_queue;
 	} run;
 #if IS_ENABLED(CONFIG_DEBUG_FS)
 	struct dentry *vp_stats_dentry;
