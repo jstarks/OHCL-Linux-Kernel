@@ -311,6 +311,17 @@ struct mshv_root_hvcall {
 #define MSHV_IMPORT_ISOLATED_PAGES	_IOW(MSHV_IOCTL, 0x0A, struct mshv_import_isolated_pages)
 
 /*
+ * Scrub a partition's guest state; takes no arguments.
+ * Stop all VP run threads first: a busy VP causes -EBUSY without issuing
+ * the hypercall. On success, the VPs are explicitly suspended.
+ *
+ * Kernel resource registrations and VP fd/mmap lifetimes are preserved.
+ * Userspace must quiesce its devices and restore guest execution state.
+ * Failure does not imply successful reset or guaranteed rollback.
+ */
+#define MSHV_SCRUB_PARTITION	_IO(MSHV_IOCTL, 0x0B)
+
+/*
  * Deprecated partition ioctls - backward compat with older userspace mshv crate v0.3.0
  * Superseded by MSHV_ROOT_HVCALL
  */

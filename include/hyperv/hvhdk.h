@@ -857,6 +857,10 @@ struct hv_input_delete_partition {
 	u64 partition_id;
 } __packed;
 
+struct hv_input_scrub_partition {
+	u64 partition_id;
+} __packed;
+
 struct hv_input_get_partition_property {
 	u64 partition_id;
 	u32 property_code; /* enum hv_partition_property_code */

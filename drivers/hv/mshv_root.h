@@ -298,6 +298,7 @@ int hv_call_create_partition(u64 flags,
 			     union hv_partition_isolation_properties isolation_properties,
 			     u64 *partition_id);
 int hv_call_initialize_partition(u64 partition_id);
+int hv_call_scrub_partition(u64 partition_id);
 int hv_call_finalize_partition(u64 partition_id);
 int hv_call_delete_partition(u64 partition_id);
 int hv_map_mmio_pages(u64 partition_id, struct mshv_mem_region *reg,

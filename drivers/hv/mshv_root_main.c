@@ -2695,6 +2695,53 @@ static long mshv_partition_snp_ioctl(unsigned int ioctl,
 }
 #endif
 
+static int mshv_partition_ioctl_scrub(struct mshv_partition *partition)
+{
+	unsigned int i, vps_locked = 0;
+	int ret;
+
+	lockdep_assert_held(&partition->pt_mutex);
+
+	/*
+	 * Run ioctls may wait indefinitely. Userspace must stop its run
+	 * threads; never wait for a VP while holding the others. The
+	 * partition mutex stabilizes even a sparse VP array.
+	 */
+	for (; vps_locked < MSHV_MAX_VPS; vps_locked++) {
+		struct mshv_vp *vp = partition->pt_vp_array[vps_locked];
+
+		if (vp && !mutex_trylock_nest_lock(&vp->vp_mutex,
+						  &partition->pt_mutex)) {
+			ret = -EBUSY;
+			goto unlock;
+		}
+	}
+
+	ret = hv_call_scrub_partition(partition->pt_id);
+	if (ret)
+		goto unlock;
+
+	/*
+	 * Scrub clears intercept suspend and sets explicit suspend.
+	 * Retain deferred waits and lifetime notification accounting.
+	 */
+	for (i = 0; i < MSHV_MAX_VPS; i++) {
+		struct mshv_vp *vp = partition->pt_vp_array[i];
+
+		if (vp)
+			vp->run.flags.intercept_suspend = 0;
+	}
+
+unlock:
+	while (vps_locked) {
+		struct mshv_vp *vp = partition->pt_vp_array[--vps_locked];
+
+		if (vp)
+			mutex_unlock(&vp->vp_mutex);
+	}
+	return ret;
+}
+
 static long
 mshv_partition_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
@@ -2708,6 +2755,9 @@ mshv_partition_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 	switch (ioctl) {
 	case MSHV_INITIALIZE_PARTITION:
 		ret = mshv_partition_ioctl_initialize(partition);
+		break;
+	case MSHV_SCRUB_PARTITION:
+		ret = mshv_partition_ioctl_scrub(partition);
 		break;
 	case MSHV_SET_GUEST_MEMORY:
 		ret = mshv_partition_ioctl_set_memory(partition, uarg);

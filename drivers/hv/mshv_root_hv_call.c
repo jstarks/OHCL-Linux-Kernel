@@ -198,6 +198,17 @@ int hv_call_initialize_partition(u64 partition_id)
 	return ret;
 }
 
+int hv_call_scrub_partition(u64 partition_id)
+{
+	u64 status;
+
+	status = hv_do_fast_hypercall8(HVCALL_SCRUB_PARTITION, partition_id);
+
+	trace_mshv_hvcall_scrub_partition(partition_id, status);
+
+	return hv_result_to_errno(status);
+}
+
 int hv_call_finalize_partition(u64 partition_id)
 {
 	struct hv_input_finalize_partition input;
