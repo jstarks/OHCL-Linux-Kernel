@@ -3037,7 +3037,16 @@ static void destroy_partition(struct mshv_partition *partition)
 		 */
 		if (hv_scheduler_type == HV_SCHEDULER_TYPE_ROOT)
 			drain_all_vps(partition);
+	}
 
+	/*
+	 * Signal accounting can finish before a reader finishes touching a VP.
+	 * Stop new lookups and wait before freeing VPs or their mapped pages.
+	 */
+	remove_partition(partition);
+	synchronize_rcu();
+
+	if (partition->pt_initialized) {
 		/* Remove vps */
 		for (i = 0; i < MSHV_MAX_VPS; ++i) {
 			vp = partition->pt_vp_array[i];
@@ -3085,8 +3094,6 @@ static void destroy_partition(struct mshv_partition *partition)
 
 		partition->pt_initialized = false;
 	}
-
-	remove_partition(partition);
 
 	hlist_for_each_entry_safe(region, n, &partition->pt_mem_regions,
 				  hnode) {
