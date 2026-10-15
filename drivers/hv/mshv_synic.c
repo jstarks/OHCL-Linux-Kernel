@@ -17,12 +17,19 @@
 #include <linux/reboot.h>
 #include <asm/mshyperv.h>
 #include <linux/acpi.h>
+#include <linux/workqueue.h>
 
 #include "mshv_eventfd.h"
 #include "mshv.h"
 
 static int synic_cpuhp_online;
 static struct hv_synic_pages __percpu *synic_pages;
+struct mshv_synic_work {
+	struct work_struct work;
+	unsigned int cpu;
+	bool enabled;
+};
+static DEFINE_PER_CPU(struct mshv_synic_work, synic_work);
 static int mshv_sint_vector = -1; /* hwirq for the SynIC SINTs */
 static int mshv_sint_irq = -1; /* Linux IRQ for mshv_sint_vector */
 
@@ -436,12 +443,16 @@ static bool mshv_eventlog_buffer_completion_isr(struct hv_message *msg)
 	return true;
 }
 
-void mshv_isr(void)
+static void mshv_synic_process(struct work_struct *work)
 {
+	struct mshv_synic_work *sw = container_of(work, struct mshv_synic_work, work);
 	struct hv_synic_pages *spages = this_cpu_ptr(synic_pages);
 	struct hv_message_page **msg_page = &spages->synic_message_page;
 	struct hv_message *msg;
 	bool handled;
+
+	if (WARN_ON_ONCE(sw->cpu != smp_processor_id()))
+		return;
 
 	if (unlikely(!(*msg_page))) {
 		pr_debug("Missing synic page!\n");
@@ -484,12 +495,29 @@ void mshv_isr(void)
 		mb();
 		if (msg->header.message_flags.msg_pending)
 			hv_set_non_nested_msr(HV_MSR_EOM, 0);
-
-		add_interrupt_randomness(mshv_sint_vector);
 	} else {
 		pr_warn_once("%s: unknown message type 0x%x\n", __func__,
 			     msg->header.message_type);
 	}
+}
+
+void mshv_isr(void)
+{
+	struct mshv_synic_work *sw = this_cpu_ptr(&synic_work);
+	struct hv_message_page *page;
+	struct hv_message *msg;
+
+	if (!READ_ONCE(sw->enabled))
+		return;
+
+	page = this_cpu_ptr(synic_pages)->synic_message_page;
+	msg = &page->sint_message[HV_SYNIC_INTERCEPTION_SINT_INDEX];
+	if (READ_ONCE(msg->header.message_type) == HVMSG_NONE)
+		return;
+
+	/* The BH owns the message until dispatch and acknowledgment finish. */
+	queue_work(system_bh_wq, &sw->work);
+	add_interrupt_randomness(mshv_sint_vector);
 }
 
 static int mshv_synic_cpu_init(unsigned int cpu)
@@ -500,11 +528,15 @@ static int mshv_synic_cpu_init(unsigned int cpu)
 	union hv_synic_sint sint;
 	union hv_synic_scontrol sctrl;
 	struct hv_synic_pages *spages = this_cpu_ptr(synic_pages);
+	struct mshv_synic_work *sw = this_cpu_ptr(&synic_work);
 	struct hv_message_page **msg_page = &spages->synic_message_page;
 	struct hv_synic_event_flags_page **event_flags_page =
 			&spages->synic_event_flags_page;
 	struct hv_synic_event_ring_page **event_ring_page =
 			&spages->synic_event_ring_page;
+
+	INIT_WORK(&sw->work, mshv_synic_process);
+	sw->cpu = cpu;
 
 	/* Setup the Synic's message page */
 	simp.as_uint64 = hv_get_non_nested_msr(HV_MSR_SIMP);
@@ -556,6 +588,7 @@ static int mshv_synic_cpu_init(unsigned int cpu)
 	sirbp.sirbp_enabled = true;
 	hv_set_non_nested_msr(HV_MSR_SIRBP, sirbp.as_uint64);
 
+	WRITE_ONCE(sw->enabled, true);
 	if (mshv_sint_irq != -1)
 		enable_percpu_irq(mshv_sint_irq, 0);
 
@@ -614,6 +647,7 @@ static int mshv_synic_cpu_exit(unsigned int cpu)
 	union hv_synic_sirbp sirbp;
 	union hv_synic_scontrol sctrl;
 	struct hv_synic_pages *spages = this_cpu_ptr(synic_pages);
+	struct mshv_synic_work *sw = this_cpu_ptr(&synic_work);
 	struct hv_message_page **msg_page = &spages->synic_message_page;
 	struct hv_synic_event_flags_page **event_flags_page =
 		&spages->synic_event_flags_page;
@@ -634,6 +668,10 @@ static int mshv_synic_cpu_exit(unsigned int cpu)
 
 	if (mshv_sint_irq != -1)
 		disable_percpu_irq(mshv_sint_irq);
+
+	/* Drain on the owning CPU before its work can migrate or pages unmap. */
+	WRITE_ONCE(sw->enabled, false);
+	flush_work(&sw->work);
 
 	/* Disable Synic's event ring page */
 	sirbp.as_uint64 = hv_get_non_nested_msr(HV_MSR_SIRBP);
