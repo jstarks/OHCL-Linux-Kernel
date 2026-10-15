@@ -1718,8 +1718,14 @@ void mshv_eventfd_release(struct mshv_partition *pt)
 	struct mshv_ioeventfd *p;
 
 	mutex_lock(&pt->pt_mutex);
-	hlist_move_list(&pt->ioeventfds_list, &items);
+	items.first = rcu_replace_pointer(pt->ioeventfds_list.first, NULL,
+					 lockdep_is_held(&pt->pt_mutex));
 	mutex_unlock(&pt->pt_mutex);
+
+	/* Readers may still hold an entry and its eventfd reference. */
+	synchronize_rcu();
+	if (items.first)
+		items.first->pprev = &items.first;
 
 	hlist_for_each_entry_safe(p, n, &items, iovntfd_hnode) {
 		hlist_del(&p->iovntfd_hnode);
