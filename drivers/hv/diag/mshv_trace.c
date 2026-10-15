@@ -30,7 +30,8 @@ struct mshv_trace_state {
 	struct mshv_trace_config cfg;
 	enum hv_eventlog_type type;
 	struct mshv_trace_buffer *tbs;
-	struct mshv_trace *trace;
+	struct mshv_trace __rcu *trace;
+	bool destroying;
 };
 
 struct mshv_trace {
@@ -55,17 +56,18 @@ static struct mshv_trace_state *mshv_trace_state;
  * the subsequent buffer. If 'next_buffer_index' equals -1, it signifies that
  * this buffer is the last one completed in the chain.
  */
-static struct mshv_trace_buffer *mshv_trace_next_buffer(u32 next_buffer_index)
+static struct mshv_trace_buffer *mshv_trace_next_buffer(
+				struct mshv_trace_state *state, u32 next_buffer_index)
 {
 	if (next_buffer_index == HV_EVENTLOG_BUFFER_INDEX_NONE)
 		return NULL;
-	return &mshv_trace_state->tbs[next_buffer_index];
+	return &state->tbs[next_buffer_index];
 }
 
 static void mshv_trace_buffer_complete(
 				const struct hv_eventlog_message_payload *msg)
 {
-	struct mshv_trace_state *state = mshv_trace_state;
+	struct mshv_trace_state *state = READ_ONCE(mshv_trace_state);
 	struct mshv_trace *trace;
 	struct mshv_trace_buffer *tb;
 
@@ -77,16 +79,14 @@ static void mshv_trace_buffer_complete(
 
 	tb = &state->tbs[msg->buffer_index];
 
-	if (!list_empty(&tb->list) ||
-	    !state->trace)
+	trace = rcu_dereference(state->trace);
+	if (!list_empty(&tb->list) || !trace)
 		return;
-
-	trace = state->trace;
 
 	spin_lock(&trace->ctb_list_lock);
 	while (tb) {
 		list_add_tail(&tb->list, &trace->ctb_list);
-		tb = mshv_trace_next_buffer(tb->hdr->next_buffer_index);
+		tb = mshv_trace_next_buffer(state, tb->hdr->next_buffer_index);
 	};
 	spin_unlock(&trace->ctb_list_lock);
 
@@ -598,13 +598,11 @@ static int mshv_trace_state_create(struct mshv_trace_state **statep,
 	enum hv_eventlog_type type = HV_EVENT_LOG_TYPE_LOCAL_DIAGNOSTICS;
 	int err;
 
-	register_mshv_trcbuf_complete_cb(mshv_trace_buffer_complete);
-
 	err = mshv_trace_buffers_group_init(cfg, type, &state);
 	if (err) {
 		pr_err("%s: failed to initialize trace buffer group: %d\n",
 		       __func__, err);
-		goto unregister_cb;
+		return err;
 	}
 
 	err = mshv_trace_buffers_create(state);
@@ -622,6 +620,7 @@ static int mshv_trace_state_create(struct mshv_trace_state **statep,
 	}
 
 	*statep = state;
+	register_mshv_trcbuf_complete_cb(mshv_trace_buffer_complete);
 
 	return 0;
 
@@ -629,14 +628,16 @@ delete_tbs:
 	(void)mshv_trace_buffers_delete(state);
 finalize_state:
 	(void)mshv_trace_buffers_group_fini(state);
-unregister_cb:
-	register_mshv_trcbuf_complete_cb(NULL);
 	return err;
 }
 
 static int mshv_trace_state_destroy(struct mshv_trace_state **statep)
 {
 	int err;
+
+	/* Keep partial teardown unavailable if a hypercall fails. */
+	(*statep)->destroying = true;
+	register_mshv_trcbuf_complete_cb(NULL);
 
 	err = mshv_trace_buffers_unmap(*statep);
 	if (!err)
@@ -648,7 +649,6 @@ static int mshv_trace_state_destroy(struct mshv_trace_state **statep)
 
 	*statep = NULL;
 
-	register_mshv_trcbuf_complete_cb(NULL);
 	return 0;
 }
 
@@ -713,7 +713,7 @@ static int mshv_trace_destroy_state_ioctl(struct mshv_trace_state **statep)
 	if (!*statep)
 		return -ENOENT;
 
-	if ((*statep)->trace)
+	if (rcu_access_pointer((*statep)->trace))
 		return -EBUSY;
 
 	return mshv_trace_state_destroy(statep);
@@ -725,13 +725,16 @@ static int mshv_trace_attach_state_ioctl(struct mshv_trace *trace,
 	if (!state)
 		return -ENOENT;
 
-	if (state->trace == trace)
-		return -EALREADY;
-
-	if (state->trace)
+	if (state->destroying)
 		return -EBUSY;
 
-	state->trace = trace;
+	if (rcu_access_pointer(state->trace) == trace)
+		return -EALREADY;
+
+	if (rcu_access_pointer(state->trace))
+		return -EBUSY;
+
+	rcu_assign_pointer(state->trace, trace);
 
 	trace->reader = current;
 
@@ -744,13 +747,14 @@ static int mshv_trace_detach_state_ioctl(const struct mshv_trace *trace,
 	if (!state)
 		return -ENOENT;
 
-	if (state->trace != trace)
+	if (rcu_access_pointer(state->trace) != trace)
 		return -EPERM;
 
 	if (trace->enabled)
 		return -EBUSY;
 
-	state->trace = NULL;
+	rcu_assign_pointer(state->trace, NULL);
+	synchronize_rcu();
 
 	return 0;
 }
@@ -911,7 +915,7 @@ static int mshv_trace_stop_ioctl(struct mshv_trace *trace,
 	if (!state)
 		return -ENOENT;
 
-	if (state->trace != trace)
+	if (rcu_access_pointer(state->trace) != trace)
 		return -EPERM;
 
 	err = mshv_trace_trace_stop(trace, state);
@@ -934,7 +938,7 @@ static int mshv_trace_start_ioctl(struct mshv_trace *trace,
 	if (!state)
 		return -ENOENT;
 
-	if (state->trace != trace)
+	if (rcu_access_pointer(state->trace) != trace)
 		return -EPERM;
 
 	if (!(flags & HV_TR_ALL_GROUPS))
@@ -996,10 +1000,14 @@ static int mshv_trace_release(struct inode *inode, struct file *filp)
 {
 	struct mshv_trace *trace = filp->private_data;
 
-	if (mshv_trace_state && mshv_trace_state->trace == trace) {
+	mutex_lock(&mshv_trace_state_lock);
+	if (mshv_trace_state &&
+	    rcu_access_pointer(mshv_trace_state->trace) == trace) {
 		(void)mshv_trace_trace_stop(trace, mshv_trace_state);
-		mshv_trace_state->trace = NULL;
+		rcu_assign_pointer(mshv_trace_state->trace, NULL);
+		synchronize_rcu();
 	}
+	mutex_unlock(&mshv_trace_state_lock);
 
 	kfree(trace);
 
@@ -1048,18 +1056,25 @@ int mshv_trace_get_fd(void)
 
 void mshv_trace_disable(void)
 {
-	struct mshv_trace_state *state = mshv_trace_state;
+	struct mshv_trace_state *state;
+	struct mshv_trace *trace;
+	int err;
 
 	mutex_lock(&mshv_trace_state_lock);
+	state = mshv_trace_state;
 
 	if (state) {
 		/*
 		 * The trace needs to be disabled before kexec, otherwise the
 		 * hypervisor won't allow to reinitialize it
 		 */
-		if (state->trace)
-			mshv_trace_trace_stop(state->trace, state);
-		mshv_trace_state_destroy(&state);
+		trace = rcu_dereference_protected(state->trace,
+						lockdep_is_held(&mshv_trace_state_lock));
+		if (trace)
+			mshv_trace_trace_stop(trace, state);
+		err = mshv_trace_state_destroy(&mshv_trace_state);
+		if (err)
+			pr_err("%s: failed to destroy trace state: %d\n", __func__, err);
 	}
 
 	mutex_unlock(&mshv_trace_state_lock);

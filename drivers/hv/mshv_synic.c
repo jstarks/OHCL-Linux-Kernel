@@ -26,7 +26,7 @@ static struct hv_synic_pages __percpu *synic_pages;
 static int mshv_sint_vector = -1; /* hwirq for the SynIC SINTs */
 static int mshv_sint_irq = -1; /* Linux IRQ for mshv_sint_vector */
 
-static void (*mshv_trcbuf_complete_cb)(
+static void (* __rcu mshv_trcbuf_complete_cb)(
                                 const struct hv_eventlog_message_payload *msg);
 
 static u32 synic_event_ring_get_queued_port(u32 sint_index)
@@ -411,20 +411,27 @@ unlock_out:
 #if IS_ENABLED(CONFIG_MSHV_DIAG)
 void register_mshv_trcbuf_complete_cb(void (*cb)(const struct hv_eventlog_message_payload *msg))
 {
-	mshv_trcbuf_complete_cb = cb;
+	rcu_assign_pointer(mshv_trcbuf_complete_cb, cb);
+	if (!cb)
+		synchronize_rcu();
 }
 EXPORT_SYMBOL_GPL(register_mshv_trcbuf_complete_cb);
 #endif
 
 static bool mshv_eventlog_buffer_completion_isr(struct hv_message *msg)
 {
+	void (*cb)(const struct hv_eventlog_message_payload *msg);
+
 	if (msg->header.message_type != HVMSG_EVENTLOG_BUFFERCOMPLETE)
 		return false;
 
-	if (mshv_trcbuf_complete_cb)
-		mshv_trcbuf_complete_cb((void *)msg->u.payload);
+	rcu_read_lock();
+	cb = rcu_dereference(mshv_trcbuf_complete_cb);
+	if (cb)
+		cb((void *)msg->u.payload);
 	else
 		pr_warn_once("%s: Handler for eventlog buffer complete ISR has not been registered\n", __func__);
+	rcu_read_unlock();
 
 	return true;
 }
