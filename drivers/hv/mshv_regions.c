@@ -340,8 +340,47 @@ static int mshv_region_chunk_unmap(struct mshv_mem_region *region,
 				       page_count, flags);
 }
 
+static int mshv_region_unmap_mmio(struct mshv_mem_region *region)
+{
+	const u64 large_pages = 1ULL << (HV_HYP_LARGE_PAGE_SHIFT - HV_HYP_PAGE_SHIFT);
+	u64 gfn = region->start_gfn, remaining = region->nr_pages;
+	int ret;
+
+	while (remaining) {
+		u64 count;
+		u32 flags = 0;
+
+		if (IS_ALIGNED(gfn, large_pages) && remaining >= large_pages) {
+			count = round_down(remaining, large_pages);
+			flags = HV_UNMAP_GPA_LARGE_PAGE;
+		} else {
+			count = min(remaining, large_pages - (gfn & (large_pages - 1)));
+			if (remaining - count < large_pages)
+				count = remaining;
+		}
+		ret = hv_call_unmap_gpa_pages(region->partition->pt_id,
+					     gfn, count, flags);
+		if (ret)
+			return ret;
+		gfn += count;
+		remaining -= count;
+	}
+	return 0;
+}
+
 int mshv_region_unmap(struct mshv_mem_region *region)
 {
+	if (region->mreg_type == MSHV_REGION_TYPE_MMIO) {
+		/*
+		 * MMIO has no struct page entries. Revoke by GPA range; large
+		 * unmap units cover either small or large existing mappings.
+		 * Partition finalization already revoked its mappings.
+		 */
+		if (!region->partition->pt_initialized)
+			return 0;
+		return mshv_region_unmap_mmio(region);
+	}
+
 	return mshv_region_process_range(region, 0,
 					 0, region->nr_pages,
 					 mshv_region_chunk_unmap);
