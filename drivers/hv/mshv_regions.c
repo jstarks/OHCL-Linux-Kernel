@@ -327,24 +327,42 @@ release_pages:
 	return ret < 0 ? ret : -ENOMEM;
 }
 
-static int mshv_region_chunk_unmap(struct mshv_mem_region *region,
-				   u32 flags,
-				   u64 page_offset, u64 page_count,
-				   bool huge_page)
-{
-	if (huge_page)
-		flags |= HV_UNMAP_GPA_LARGE_PAGE;
-
-	return hv_call_unmap_gpa_pages(region->partition->pt_id,
-				       region->start_gfn + page_offset,
-				       page_count, flags);
-}
-
 int mshv_region_unmap(struct mshv_mem_region *region)
 {
-	return mshv_region_process_range(region, 0,
-					 0, region->nr_pages,
-					 mshv_region_chunk_unmap);
+	const u64 large_pages =
+		1ULL << (HV_HYP_LARGE_PAGE_SHIFT - HV_HYP_PAGE_SHIFT);
+	u64 gfn = region->start_gfn, remaining = region->nr_pages;
+	int ret;
+
+	/* Partition finalization already revoked its mappings. */
+	if (!region->partition->pt_initialized)
+		return 0;
+
+	/*
+	 * NULL page entries can still have no-access GPA mappings. Unmap the
+	 * entire range, including MMIO mappings with no struct page entries.
+	 */
+	while (remaining) {
+		u64 count;
+		u32 flags = 0;
+
+		if (IS_ALIGNED(gfn, large_pages) && remaining >= large_pages) {
+			count = round_down(remaining, large_pages);
+			flags = HV_UNMAP_GPA_LARGE_PAGE;
+		} else {
+			count = min(remaining,
+				    large_pages - (gfn & (large_pages - 1)));
+			if (remaining - count < large_pages)
+				count = remaining;
+		}
+		ret = hv_call_unmap_gpa_pages(region->partition->pt_id,
+					     gfn, count, flags);
+		if (ret)
+			return ret;
+		gfn += count;
+		remaining -= count;
+	}
+	return 0;
 }
 
 static void mshv_region_destroy(struct kref *ref)
