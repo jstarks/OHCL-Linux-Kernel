@@ -391,57 +391,40 @@ int hv_map_mmio_pages(u64 partition_id, struct mshv_mem_region *reg,
 		      u64 mmio_mfn)
 {
 	int rc;
-	u64 gfn, start_mmio_mfn, hpages;
-	u32 numpgs = 0, flags = HV_MAP_GPA_READABLE;
-	u64 numpgs_in_hpage = HPAGE_SIZE / PAGE_SIZE;
+	const u64 large_pages = 1ULL << (HV_HYP_LARGE_PAGE_SHIFT - HV_HYP_PAGE_SHIFT);
+	u64 gfn = reg->start_gfn, remaining = reg->nr_pages;
+	u32 flags = HV_MAP_GPA_READABLE;
+	bool same_alignment = IS_ALIGNED(gfn ^ mmio_mfn, large_pages);
 
 	if (reg->hv_map_flags & HV_MAP_GPA_WRITABLE)
 		flags |= HV_MAP_GPA_WRITABLE;
 	if (reg->hv_map_flags & HV_MAP_GPA_EXECUTABLE)
 		flags |= HV_MAP_GPA_EXECUTABLE;
 
-	/*
-	 * Any significantly large range is expected to be properly aligned,
-	 * so keep it simple.
-	 */
-	gfn = reg->start_gfn;
-	start_mmio_mfn = mmio_mfn;
-	while (!HV_PAGE_COUNT_2M_ALIGNED(gfn) &&
-	       !HV_PAGE_COUNT_2M_ALIGNED(mmio_mfn) &&
-	       numpgs < reg->nr_pages) {
-		numpgs++;
-		gfn++;
-		mmio_mfn++;
+	while (remaining) {
+		u64 count = remaining;
+		u32 map_flags = flags;
+
+		/* Different source/destination offsets require small pages throughout. */
+		if (same_alignment) {
+			if (!IS_ALIGNED(gfn, large_pages)) {
+				count = min(remaining, large_pages - (gfn & (large_pages - 1)));
+				if (remaining - count < large_pages)
+					count = remaining;
+			} else if (remaining >= large_pages) {
+				count = round_down(remaining, large_pages);
+				map_flags |= HV_MAP_GPA_LARGE_PAGE;
+			}
+		}
+		rc = hv_do_map_gpa_hcall(partition_id, gfn, count, map_flags,
+					 NULL, mmio_mfn);
+		if (rc)
+			return rc;
+		gfn += count;
+		mmio_mfn += count;
+		remaining -= count;
 	}
-	rc = hv_do_map_gpa_hcall(partition_id, reg->start_gfn, numpgs, flags,
-				 NULL, start_mmio_mfn);
-	if (rc || numpgs == reg->nr_pages)
-		return rc;
-
-	numpgs = reg->nr_pages - numpgs;
-
-	if (numpgs < numpgs_in_hpage)
-		return hv_do_map_gpa_hcall(partition_id, gfn, numpgs, flags,
-					   NULL, mmio_mfn);
-
-	for (hpages = 0; numpgs >= numpgs_in_hpage;) {
-		hpages++;
-		numpgs = numpgs - numpgs_in_hpage;
-	}
-	rc = hv_do_map_gpa_hcall(partition_id, gfn, hpages * numpgs_in_hpage,
-				 flags | HV_MAP_GPA_LARGE_PAGE, NULL, mmio_mfn);
-	if (rc)
-		return rc;
-
-	if (numpgs) {
-		gfn = gfn + hpages * numpgs_in_hpage;
-		mmio_mfn = mmio_mfn + hpages * numpgs_in_hpage;
-
-		rc = hv_do_map_gpa_hcall(partition_id, gfn, numpgs, flags, NULL,
-					 mmio_mfn);
-	}
-
-	return rc;
+	return 0;
 }
 
 int hv_call_unmap_gpa_pages(u64 partition_id, u64 gfn, u64 page_count_4k,
